@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 480" role="img" aria-labelledby="title desc">
+  <title id="title">apex-code banner logo</title>
+  <desc id="desc">Horizontal banner logo for apex-code with mark, wordmark, and positioning line.</desc>
+  <defs>
+    <linearGradient id="emeraldEdgeBanner" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4AF2B5"/>
+      <stop offset="100%" stop-color="#1DBA83"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="480" rx="72" fill="#0E1417"/>
+  <rect x="22" y="22" width="1556" height="436" rx="50" fill="none" stroke="#22343A" stroke-width="2"/>
+  <g transform="translate(80 80)">
+    <rect width="320" height="320" rx="64" fill="#121B1F"/>
+    <path d="M64 244 144 64h34l78 180h-43l-18-42h-69l-19 42z" fill="#F7F8F6"/>
+    <path d="M140 165h38l-18-46z" fill="#121B1F"/>
+    <path d="M182 92h98L201 244h-40z" fill="url(#emeraldEdgeBanner)"/>
+    <rect x="214" y="208" width="58" height="12" rx="6" fill="#4AF2B5"/>
+  </g>
+  <g transform="translate(470 132)">
+    <text x="0" y="116" font-size="162" font-weight="700" letter-spacing="-5" font-family="Inter, Segoe UI, Arial, sans-serif" fill="#F7F8F6">apex-code</text>
+    <text x="6" y="198" font-size="34" font-weight="600" letter-spacing="9" font-family="JetBrains Mono, IBM Plex Mono, monospace" fill="#4AF2B5">LOCAL-FIRST CODING AGENT</text>
+    <line x1="0" y1="244" x2="870" y2="244" stroke="#22343A" stroke-width="2"/>
+    <text x="0" y="296" font-size="36" font-weight="500" letter-spacing=".5" font-family="Inter, Segoe UI, Arial, sans-serif" fill="#93A8AA">Blazing-fast execution. Aggressive token efficiency.</text>
+  </g>
+</svg>

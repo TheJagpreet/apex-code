@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">apex-code mark</title>
+  <desc id="desc">Geometric A monogram with a fast execution slash and emerald terminal pulse.</desc>
+  <defs>
+    <linearGradient id="emeraldEdge" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4AF2B5"/>
+      <stop offset="100%" stop-color="#1DBA83"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#0E1417"/>
+  <rect x="28" y="28" width="456" height="456" rx="92" fill="none" stroke="#203036" stroke-width="2"/>
+  <path d="M108 386 232 118h52l120 268h-65l-29-68H201l-31 68z" fill="#F7F8F6"/>
+  <path d="M227 261h58l-28-68z" fill="#0E1417"/>
+  <path d="M288 162 396 162 252 354h-59z" fill="url(#emeraldEdge)"/>
+  <rect x="301" y="335" width="94" height="20" rx="10" fill="#4AF2B5"/>
+  <circle cx="407" cy="345" r="10" fill="#4AF2B5" opacity=".35"/>
+</svg>

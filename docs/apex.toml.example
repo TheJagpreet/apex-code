@@ -1,0 +1,27 @@
+model = "gemma4:e2b"
+ollama_url = "http://localhost:11434"
+max_iterations = 8
+lazy_tools = true
+skills = [".apex/skills"]
+data_dir = ".apex"
+state_db = ".apex/apex.db"
+resume = "latest"
+
+[budget]
+system = 0.10
+tools = 0.10
+history = 0.40
+retrieved = 0.15
+working_files = 0.15
+output_headroom = 0.10
+
+[features]
+sessions = true
+telemetry = true
+mcp = true
+
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+enabled = false

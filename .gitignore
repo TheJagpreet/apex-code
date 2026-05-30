@@ -1,0 +1,14 @@
+/bin/
+*.exe
+*.out
+*.test
+.DS_Store
+apex.db
+*.db
+/dist/
+.env
+.apex/
+.gocache/
+.github/
+*.log
+error.log
