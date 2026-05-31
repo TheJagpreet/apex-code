@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apex-code/apex/internal/domain"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	ignore "github.com/sabhiram/go-gitignore"
@@ -26,6 +27,7 @@ const (
 	PaneContext
 	PaneStats
 	PaneHelp
+	PanePlan
 )
 
 func (p Pane) String() string {
@@ -40,6 +42,8 @@ func (p Pane) String() string {
 		return "stats"
 	case PaneHelp:
 		return "help"
+	case PanePlan:
+		return "plan"
 	default:
 		return "chat"
 	}
@@ -51,7 +55,9 @@ type runtimeStatus struct {
 	Session   string
 	Companion string
 	Theme     string
+	ContextSummary string
 	LazyTools bool
+	Mode      string
 }
 
 // replyMsg carries an agent reply back into the Bubble Tea update loop.
@@ -65,6 +71,10 @@ type tickMsg time.Time
 // streamDeltaMsg carries one chunk of streamed assistant text into the update
 // loop. The terminating replyMsg (success or error) arrives on the same channel.
 type streamDeltaMsg struct{ text string }
+
+type progressMsg struct {
+	reply Reply
+}
 
 // waitStream blocks on the streaming channel and surfaces the next event as a
 // tea.Msg. It is re-armed after every delta until the final replyMsg arrives.
@@ -114,6 +124,7 @@ type Model struct {
 	copyStatus      string
 	verbose         bool
 	quitting        bool
+	workflow        *domain.CoderWorkflow
 }
 
 // New builds a TUI model.
@@ -128,6 +139,7 @@ func New(ctx context.Context, agent Agent, verbose bool) Model {
 		selectedEntry: -1,
 		fileIndex:     indexProjectEntries(agent.CWD()),
 		verbose:       verbose,
+		workflow:      agent.CoderWorkflow(),
 	}
 }
 
@@ -169,10 +181,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.lastErr = nil
+		if len(m.transcript) > 0 && m.transcript[len(m.transcript)-1].Kind == entryStatus && m.transcript[len(m.transcript)-1].Title == "Workflow progress" {
+			m.transcript = m.transcript[:len(m.transcript)-1]
+		}
 		m.budget = msg.reply.Budget
 		m.tools = msg.reply.ToolCalls
 		m.diffs = msg.reply.Diffs
 		m.stats = msg.reply.Stats
+		m.workflow = msg.reply.Workflow
 		m.transcript = append(m.transcript, transcriptEntry{
 			Kind:  entryAssistant,
 			Title: "apex",
@@ -182,6 +198,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selectLatestEntry()
 		m.scrollToBottom()
 		return m, nil
+
+	case progressMsg:
+		m.lastErr = nil
+		m.budget = msg.reply.Budget
+		m.stats = msg.reply.Stats
+		m.workflow = msg.reply.Workflow
+		if text := strings.TrimSpace(msg.reply.Text); text != "" {
+			entry := transcriptEntry{
+				Kind:  entryStatus,
+				Title: "Workflow progress",
+				Body:  text,
+			}
+			if len(m.transcript) > 0 && m.transcript[len(m.transcript)-1].Kind == entryStatus && m.transcript[len(m.transcript)-1].Title == "Workflow progress" {
+				m.transcript[len(m.transcript)-1] = entry
+			} else {
+				m.transcript = append(m.transcript, entry)
+			}
+			m.selectLatestEntry()
+			m.scrollToBottom()
+		}
+		return m, waitStream(m.streamCh)
 
 	case tickMsg:
 		if m.working {
@@ -218,6 +255,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "shift+enter" {
+		m.input += "\n"
+		m.updateSuggestions()
+		return m, nil
+	}
+	switch msg.String() {
+	case "alt+p":
+		m.pet = m.pet.cyclePersona()
+		return m, nil
+	case "alt+t":
+		m.cycleTheme()
+		return m, nil
+	}
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		if m.working && m.cancelRun != nil {
@@ -238,16 +288,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		m.quitting = true
 		return m, tea.Quit
-	case tea.KeyCtrlJ:
-		m.input += "\n"
-		m.updateSuggestions()
-		return m, nil
 	case tea.KeyCtrlU:
 		m.input = ""
 		m.clearSuggestions()
 		return m, nil
 	case tea.KeyCtrlO:
-		m.pane = (m.pane + 1) % 6
+		m.pane = (m.pane + 1) % 7
 		return m, nil
 	case tea.KeyCtrlY:
 		if err := m.copySelectedEntry(); err != nil {
@@ -256,22 +302,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.copyStatus = "Copied selected message to clipboard."
 		}
 		return m, nil
-	case tea.KeyF2:
-		m.pet = m.pet.cyclePersona()
-		return m, nil
-	case tea.KeyF3:
-		m.cycleTheme()
-		return m, nil
 	case tea.KeyTab:
 		if len(m.suggestions) > 0 {
 			m.acceptSuggestion()
 		} else {
-			m.pane = (m.pane + 1) % 6
+			m.pane = (m.pane + 1) % 7
 		}
 		return m, nil
 	case tea.KeyShiftTab:
 		if m.pane == 0 {
-			m.pane = 5
+			m.pane = 6
 		} else {
 			m.pane--
 		}
@@ -405,12 +445,74 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 	go func() {
 		defer cancel()
 		defer close(ch)
-		reply, err := agent.Stream(ctx, prompt, func(delta string) {
-			select {
-			case ch <- streamDeltaMsg{text: delta}:
-			case <-ctx.Done():
-			}
-		})
+		var (
+			reply Reply
+			err   error
+		)
+		if agent.Mode() == "coder" {
+			reply, err = agent.CoderSubmit(ctx, prompt)
+		} else {
+			reply, err = agent.Stream(ctx, prompt, func(delta string) {
+				select {
+				case ch <- streamDeltaMsg{text: delta}:
+				case <-ctx.Done():
+				}
+			})
+		}
+		ch <- replyMsg{reply: reply, err: err}
+	}()
+	return m, waitStream(ch)
+}
+
+func (m Model) startCoderAction(title string, fn func(context.Context) (Reply, error)) (tea.Model, tea.Cmd) {
+	if m.working {
+		return m, nil
+	}
+	m.transcript = append(m.transcript, transcriptEntry{
+		Kind:  entryStatus,
+		Title: title,
+		Body:  "Working...",
+	})
+	m.selectLatestEntry()
+	m.scrollToBottom()
+	m.working = true
+	m.streamFx = streamFx{}
+
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.cancelRun = cancel
+	ch := make(chan tea.Msg, 8)
+	m.streamCh = ch
+	go func() {
+		defer cancel()
+		defer close(ch)
+		reply, err := fn(ctx)
+		ch <- replyMsg{reply: reply, err: err}
+	}()
+	return m, waitStream(ch)
+}
+
+func (m Model) startCoderStreamAction(title string, fn func(context.Context, chan tea.Msg) (Reply, error)) (tea.Model, tea.Cmd) {
+	if m.working {
+		return m, nil
+	}
+	m.transcript = append(m.transcript, transcriptEntry{
+		Kind:  entryStatus,
+		Title: title,
+		Body:  "Working...",
+	})
+	m.selectLatestEntry()
+	m.scrollToBottom()
+	m.working = true
+	m.streamFx = streamFx{}
+
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.cancelRun = cancel
+	ch := make(chan tea.Msg, 32)
+	m.streamCh = ch
+	go func() {
+		defer cancel()
+		defer close(ch)
+		reply, err := fn(ctx, ch)
 		ch <- replyMsg{reply: reply, err: err}
 	}()
 	return m, waitStream(ch)
@@ -443,6 +545,68 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		if len(fields) > 1 {
 			m.pane = paneFromName(fields[1])
 		}
+	case "/plan":
+		m.transcript = append(m.transcript, transcriptEntry{
+			Kind:  entryAssistant,
+			Title: "apex",
+			Body:  renderPlanChat(m.workflow),
+		})
+		m.selectLatestEntry()
+		m.scrollToBottom()
+	case "/mode":
+		if len(fields) == 1 {
+			m.transcript = append(m.transcript, transcriptEntry{
+				Kind:  entryStatus,
+				Title: "Mode",
+				Body:  "Current mode: " + m.agent.Mode(),
+			})
+			m.selectLatestEntry()
+			m.scrollToBottom()
+			break
+		}
+		if err := m.agent.SetMode(m.ctx, fields[1]); err != nil {
+			return m, nil, err
+		}
+		m.workflow = m.agent.CoderWorkflow()
+		m.transcript = append(m.transcript, transcriptEntry{
+			Kind:  entryStatus,
+			Title: "Mode switched",
+			Body:  "Active mode is now " + m.agent.Mode(),
+		})
+		m.selectLatestEntry()
+		m.scrollToBottom()
+	case "/approve":
+		next, cmd := m.startCoderStreamAction("Approving plan", func(ctx context.Context, ch chan tea.Msg) (Reply, error) {
+			if _, err := m.agent.CoderApprove(ctx); err != nil {
+				return Reply{}, err
+			}
+			return m.agent.CoderExecuteStream(ctx, func(reply Reply) {
+				select {
+				case ch <- progressMsg{reply: reply}:
+				case <-ctx.Done():
+				}
+			})
+		})
+		return next.(Model), cmd, nil
+	case "/replan":
+		feedback := strings.TrimSpace(strings.TrimPrefix(cmd, fields[0]))
+		if feedback == "" {
+			return m, nil, fmt.Errorf("usage: /replan <feedback>")
+		}
+		next, cmd := m.startCoderAction("Replanning", func(ctx context.Context) (Reply, error) {
+			return m.agent.CoderReview(ctx, feedback)
+		})
+		return next.(Model), cmd, nil
+	case "/runplan":
+		next, cmd := m.startCoderStreamAction("Running plan", func(ctx context.Context, ch chan tea.Msg) (Reply, error) {
+			return m.agent.CoderExecuteStream(ctx, func(reply Reply) {
+				select {
+				case ch <- progressMsg{reply: reply}:
+				case <-ctx.Done():
+				}
+			})
+		})
+		return next.(Model), cmd, nil
 	case "/quit":
 		m.quitting = true
 		return m, tea.Quit, nil
@@ -663,7 +827,9 @@ func (m Model) View() string {
 		Session:   m.agent.SessionLabel(),
 		Companion: m.pet.currentPersona().Name,
 		Theme:     themeName(m.themeIndex),
+		ContextSummary: renderBudgetCompact(m.budget),
 		LazyTools: m.agent.LazyTools(),
+		Mode:      m.agent.Mode(),
 	}
 	inner := m.frameInnerWidth()
 	header := wrapTo(m.headerView(status), inner)
@@ -727,13 +893,17 @@ func (m Model) headerView(status runtimeStatus) string {
 // frameInnerWidth is the usable text width inside the app frame, accounting for
 // the rounded border and horizontal padding applied by renderAppFrame.
 func (m Model) frameInnerWidth() int {
-	frameWidth := m.width - 2
-	if frameWidth < 70 {
-		frameWidth = 70
+	return innerWidthFromFrame(m.width)
+}
+
+func innerWidthFromFrame(width int) int {
+	frameWidth := width - 2
+	if frameWidth < 20 {
+		frameWidth = 20
 	}
 	inner := frameWidth - 6 // border (2) + horizontal padding (2*2)
-	if inner < 20 {
-		inner = 20
+	if inner < 8 {
+		inner = 8
 	}
 	return inner
 }
@@ -753,34 +923,59 @@ func wrapTo(s string, width int) string {
 // conversation viewport can claim the remaining rows.
 func (m Model) renderChrome(status runtimeStatus) string {
 	var b strings.Builder
+	hasSection := false
 	if m.working {
 		b.WriteString(renderLoader(m.loaderFrame, m.loaderPhrase))
-		b.WriteString("\n\n")
+		hasSection = true
 	}
 	switch m.pane {
 	case PaneTools:
-		b.WriteString(renderToolInspector(m.tools))
-	case PaneDiffs:
-		b.WriteString(renderDiffs(m.diffs))
-	case PaneContext:
-		b.WriteString(renderContextPane(m.Pins(), m.recentRefs))
-	case PaneStats:
-		b.WriteString(renderStatsPane(m.budget, m.stats, m.verbose))
-	case PaneHelp:
-		b.WriteString(renderHelpPane())
-	default:
-		if m.verbose {
-			b.WriteString(styleDim.Render("Chat pane focused. Use [ctrl+o] or /pane to inspect tools, diffs, context, stats, and help."))
-		} else {
-			b.WriteString(styleDim.Render("Chat pane focused. Use /help for commands and /verbose for deeper runtime details."))
+		if hasSection {
+			b.WriteString("\n\n")
 		}
+		b.WriteString(renderToolInspector(m.tools))
+		hasSection = true
+	case PaneDiffs:
+		if hasSection {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderDiffs(m.diffs))
+		hasSection = true
+	case PaneContext:
+		if hasSection {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderContextPane(m.Pins(), m.recentRefs))
+		hasSection = true
+	case PaneStats:
+		if hasSection {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderStatsPane(m.budget, m.stats, m.verbose))
+		hasSection = true
+	case PaneHelp:
+		if hasSection {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderHelpPane())
+		hasSection = true
+	case PanePlan:
+		if hasSection {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderPlanPane(m.workflow))
+		hasSection = true
+	default:
+		// Keep the chat area visually quiet in the default pane.
 	}
-	b.WriteString("\n\n")
-	b.WriteString(renderStatsStrip(m.budget, m.stats, m.width, m.verbose))
-	b.WriteString("\n\n")
-	b.WriteString(renderComposer(m.input, m.suggestions, m.suggestionIndex, m.pane, m.width, m.verbose, m.copyStatus))
-	b.WriteString("\n")
-	b.WriteString(renderStatusFooter(status, m.pane))
+	if hasSection {
+		b.WriteString("\n\n")
+	}
+	b.WriteString(renderComposer(m.input, m.suggestions, m.suggestionIndex, m.pane, innerWidthFromFrame(m.width), m.verbose, m.copyStatus, m.working))
+	if footer := renderStatusFooter(status, m.pane); strings.TrimSpace(footer) != "" {
+		b.WriteString("\n")
+		b.WriteString(footer)
+	}
 	b.WriteString("\n")
 	b.WriteString(m.pet.render(m.width, m.working))
 	return b.String()
@@ -791,7 +986,15 @@ func (m Model) renderChrome(status runtimeStatus) string {
 // conversation overflows the viewport.
 func (m Model) renderConversation(height, inner int) string {
 	if len(m.transcript) == 0 {
-		return styleDim.Render("No conversation yet. Try `@README.md summarize this repo` or `/review`.")
+		return styleConversationFrame.Width(inner).Render(styleDim.Render("No conversation yet. Try `@README.md summarize this repo` or `/review`."))
+	}
+	frameInner := inner - 2
+	if frameInner < 16 {
+		frameInner = 16
+	}
+	contentHeight := height - 2
+	if contentHeight < 1 {
+		contentHeight = 1
 	}
 	// Leave two columns for the scrollbar (" " + bar) so wrapped lines plus the
 	// bar never exceed the frame's inner width.
@@ -802,23 +1005,23 @@ func (m Model) renderConversation(height, inner int) string {
 		}
 		content += renderStreamEntry(m.streamFx)
 	}
-	wrapped := wrapTo(content, inner-2)
+	wrapped := wrapTo(content, frameInner-2)
 	lines := strings.Split(wrapped, "\n")
 	total := len(lines)
-	if total <= height {
-		return wrapped
+	if total <= contentHeight {
+		return styleConversationFrame.Width(inner).Render(wrapped)
 	}
 	end := total - m.scrollOffset
 	if end > total {
 		end = total
 	}
-	if end < height {
-		end = height
+	if end < contentHeight {
+		end = contentHeight
 	}
-	start := end - height
+	start := end - contentHeight
 	window := strings.Join(lines[start:end], "\n")
-	bar := renderScrollbar(total, height, m.scrollOffset, height)
-	return lipgloss.JoinHorizontal(lipgloss.Top, window, " ", bar)
+	bar := renderScrollbar(total, contentHeight, m.scrollOffset, contentHeight)
+	return styleConversationFrame.Width(inner).Render(lipgloss.JoinHorizontal(lipgloss.Top, window, " ", bar))
 }
 
 // Run starts the interactive TUI program.
@@ -834,6 +1037,13 @@ func (m *Model) clearSuggestions() {
 }
 
 func (m *Model) updateSuggestions() {
+	if suggestions := modeSuggestions(m.input); len(suggestions) > 0 {
+		m.suggestions = suggestions
+		if m.suggestionIndex >= len(m.suggestions) {
+			m.suggestionIndex = 0
+		}
+		return
+	}
 	token := currentToken(m.input)
 	switch {
 	case strings.HasPrefix(token, "/"):
@@ -851,6 +1061,10 @@ func (m *Model) updateSuggestions() {
 func (m Model) shouldAcceptSuggestionOnEnter() bool {
 	if len(m.suggestions) == 0 {
 		return false
+	}
+	if suggestions := modeSuggestions(m.input); len(suggestions) > 0 {
+		selected := m.suggestions[m.suggestionIndex]
+		return strings.TrimSpace(m.input) != strings.TrimSpace(selected.Insert) && strings.TrimSpace(m.input) != selected.Label
 	}
 	token := currentToken(m.input)
 	if token == "" {
@@ -871,6 +1085,9 @@ func (m *Model) acceptSuggestion() {
 	s := m.suggestions[m.suggestionIndex]
 	if s.Replace != "" && strings.HasSuffix(m.input, s.Replace) {
 		m.input = strings.TrimSuffix(m.input, s.Replace) + s.Insert
+	} else if s.Replace != "" && strings.HasSuffix(strings.TrimRight(m.input, " "), s.Replace) {
+		trimmed := strings.TrimRight(m.input, " ")
+		m.input = strings.TrimSuffix(trimmed, s.Replace) + s.Insert
 	} else {
 		m.input += s.Insert
 	}
@@ -915,7 +1132,9 @@ func (m *Model) scrollMetrics() (total, height int) {
 		Session:   m.agent.SessionLabel(),
 		Companion: m.pet.currentPersona().Name,
 		Theme:     themeName(m.themeIndex),
+		ContextSummary: renderBudgetCompact(m.budget),
 		LazyTools: m.agent.LazyTools(),
+		Mode:      m.agent.Mode(),
 	}
 	inner := m.frameInnerWidth()
 	height = m.conversationHeight(wrapTo(m.headerView(status), inner), wrapTo(m.renderChrome(status), inner))
@@ -972,6 +1191,8 @@ func paneFromName(name string) Pane {
 		return PaneStats
 	case "help":
 		return PaneHelp
+	case "plan":
+		return PanePlan
 	default:
 		return PaneChat
 	}
@@ -1012,6 +1233,41 @@ func commandSuggestions(token string) []suggestion {
 		}
 	}
 	return limitSuggestions(out)
+}
+
+func modeSuggestions(input string) []suggestion {
+	trimmed := strings.TrimSpace(strings.ToLower(input))
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/mode") {
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "/mode chat") || strings.HasPrefix(trimmed, "/mode coder") {
+		return nil
+	}
+	query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/mode"))
+	options := []suggestion{
+		{Label: "/mode chat", Insert: "/mode chat", Detail: "switch to normal chat mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
+		{Label: "/mode coder", Insert: "/mode coder", Detail: "switch to coder workflow mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
+	}
+	if query == "" {
+		return options
+	}
+	var ranked []suggestion
+	for _, option := range options {
+		mode := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(option.Label), "/mode"))
+		if strings.HasPrefix(mode, query) {
+			ranked = append(ranked, option)
+		}
+	}
+	if len(ranked) > 0 {
+		return ranked
+	}
+	for _, option := range options {
+		mode := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(option.Label), "/mode"))
+		if strings.Contains(mode, query) {
+			ranked = append(ranked, option)
+		}
+	}
+	return ranked
 }
 
 func fileSuggestions(token string, files []string) []suggestion {

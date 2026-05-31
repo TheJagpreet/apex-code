@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apex-code/apex/internal/domain"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -19,6 +20,8 @@ type stubAgent struct {
 	newCalls   int
 	modelCalls []string
 	sessions   []SessionOption
+	mode       string
+	workflow   *domain.CoderWorkflow
 }
 
 func (s *stubAgent) Send(_ context.Context, prompt string) (Reply, error) {
@@ -50,6 +53,72 @@ func (s *stubAgent) SetModel(_ context.Context, model string) error {
 }
 func (s *stubAgent) ListSessions(_ context.Context, _ int) ([]SessionOption, error) {
 	return s.sessions, nil
+}
+func (s *stubAgent) Mode() string {
+	if s.mode == "" {
+		return "chat"
+	}
+	return s.mode
+}
+func (s *stubAgent) SetMode(_ context.Context, mode string) error {
+	s.mode = mode
+	return nil
+}
+func (s *stubAgent) CoderSubmit(_ context.Context, prompt string) (Reply, error) {
+	s.mode = "coder"
+	s.workflow = &domain.CoderWorkflow{
+		SchemaVersion: 1,
+		ID:            "wf-1",
+		Mode:          "coder",
+		UserPrompt:    prompt,
+		PlanVersion:   1,
+		State:         domain.WorkflowStatePlanReview,
+		Tasks: []domain.WorkflowTask{
+			{ID: "t1", Title: "Inspect", Description: "Inspect the repo", Status: domain.WorkflowTaskReady, OwnerAgent: domain.WorkflowAgentArchitecture},
+		},
+	}
+	return Reply{Text: "## Capabilities Of Agents\n\n### orchestrator\n- enriches your request\n\n## Plan\n\n1. `architecture` -> Inspect the repo", Mode: "coder", Workflow: s.workflow}, nil
+}
+func (s *stubAgent) CoderReview(_ context.Context, feedback string) (Reply, error) {
+	if s.workflow != nil {
+		s.workflow.PlanVersion++
+		s.workflow.UserPrompt += " " + feedback
+	}
+	return Reply{Text: "Plan revised.", Mode: s.Mode(), Workflow: s.workflow}, nil
+}
+func (s *stubAgent) CoderApprove(_ context.Context) (Reply, error) {
+	if s.workflow != nil {
+		s.workflow.State = domain.WorkflowStateApproved
+	}
+	return Reply{Text: "Plan approved.", Mode: s.Mode(), Workflow: s.workflow}, nil
+}
+func (s *stubAgent) CoderExecute(_ context.Context) (Reply, error) {
+	if s.workflow != nil {
+		s.workflow.State = domain.WorkflowStateCompleted
+		if len(s.workflow.Tasks) > 0 {
+			s.workflow.Tasks[0].Status = domain.WorkflowTaskDone
+		}
+	}
+	return Reply{Text: "Plan execution updated: completed", Mode: s.Mode(), Workflow: s.workflow, Stats: "coder workflow"}, nil
+}
+func (s *stubAgent) CoderExecuteStream(ctx context.Context, onUpdate func(Reply)) (Reply, error) {
+	if s.workflow != nil && len(s.workflow.Tasks) > 0 {
+		onUpdate(Reply{Text: "## `architecture` Started\n\nWorking on it now.", Mode: s.Mode(), Workflow: s.workflow})
+		s.workflow.Tasks[0].Status = domain.WorkflowTaskDone
+		s.workflow.State = domain.WorkflowStateCompleted
+		onUpdate(Reply{Text: "## `architecture` Completed\n\nInspected the repo.", Mode: s.Mode(), Workflow: s.workflow})
+	}
+	return s.CoderExecute(ctx)
+}
+func (s *stubAgent) CoderWorkflow() *domain.CoderWorkflow { return s.workflow }
+
+func (m Model) submitPromptForTest(prompt string) (Model, error) {
+	reply, err := m.agent.CoderSubmit(m.ctx, prompt)
+	if err != nil {
+		return m, err
+	}
+	got, _ := m.Update(replyMsg{reply: reply})
+	return got.(Model), nil
 }
 
 func TestStreamFxSettlesAndShimmers(t *testing.T) {
@@ -86,8 +155,11 @@ func TestRenderBudgetMeter(t *testing.T) {
 		t.Fatalf("verbose meter missing headroom: %q", verbose)
 	}
 
-	if got := renderBudgetMeter(BudgetSnapshot{}, 8, false); got == "" {
-		t.Fatal("meter should render with empty snapshot")
+	if got := renderBudgetMeter(BudgetSnapshot{PromptTokens: 1234}, 8, false); !strings.Contains(strings.ToLower(got), "1234/infinity") {
+		t.Fatalf("empty budget should render infinity usage, got %q", got)
+	}
+	if got := renderBudgetCompact(BudgetSnapshot{PromptTokens: 1234, PromptLimit: 4096}); got != "tok 1234" {
+		t.Fatalf("compact budget wrong: %q", got)
 	}
 }
 
@@ -129,8 +201,25 @@ func TestModelPinUnpin(t *testing.T) {
 
 func TestCommandSuggestions(t *testing.T) {
 	got := commandSuggestions("/mo")
-	if len(got) == 0 || got[0].Label != "/model" {
+	if len(got) == 0 || got[0].Label != "/mode" {
 		t.Fatalf("command suggestions wrong: %+v", got)
+	}
+}
+
+func TestModeSuggestionsShowConcreteModes(t *testing.T) {
+	got := modeSuggestions("/mode")
+	if len(got) != 2 {
+		t.Fatalf("mode suggestions wrong: %+v", got)
+	}
+	if got[0].Label != "/mode chat" || got[1].Label != "/mode coder" {
+		t.Fatalf("unexpected mode suggestion labels: %+v", got)
+	}
+}
+
+func TestModeSuggestionsPrioritizeMatchingPartialMode(t *testing.T) {
+	got := modeSuggestions("/mode cod")
+	if len(got) != 1 || got[0].Label != "/mode coder" {
+		t.Fatalf("mode suggestions should prioritize coder for partial cod: %+v", got)
 	}
 }
 
@@ -169,6 +258,65 @@ func TestCommandModelResumeNew(t *testing.T) {
 	}
 }
 
+func TestCoderModeCommandsDriveWorkflow(t *testing.T) {
+	agent := &stubAgent{model: "gemma4:e2b", cwd: ".", session: "new"}
+	m := New(context.Background(), agent, false)
+
+	var err error
+	m, _, err = m.command("/mode coder")
+	if err != nil {
+		t.Fatalf("mode: %v", err)
+	}
+	if agent.Mode() != "coder" {
+		t.Fatalf("mode = %q", agent.Mode())
+	}
+
+	next, err := m.submitPromptForTest("Build coder mode")
+	if err != nil {
+		t.Fatalf("submit coder prompt: %v", err)
+	}
+	if next.workflow == nil || next.workflow.Mode != "coder" {
+		t.Fatalf("workflow = %+v", next.workflow)
+	}
+
+	next, _, err = next.command("/approve")
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if !next.working {
+		t.Fatal("approve should start async execution")
+	}
+	gotApprove, _ := next.Update(replyMsg{reply: Reply{Text: "Coder workflow execution updated: completed", Workflow: &domain.CoderWorkflow{State: domain.WorkflowStateCompleted}}})
+	next = gotApprove.(Model)
+	if next.workflow == nil || next.workflow.State != domain.WorkflowStateCompleted {
+		t.Fatalf("workflow state = %+v", next.workflow)
+	}
+}
+
+func TestPlanCommandPrintsPlanIntoChat(t *testing.T) {
+	agent := &stubAgent{model: "gemma4:e2b", cwd: ".", session: "new", mode: "coder", workflow: &domain.CoderWorkflow{
+		SchemaVersion: 1,
+		ID:            "wf-1",
+		Mode:          "coder",
+		State:         domain.WorkflowStatePlanReview,
+		PlanVersion:   1,
+		Tasks: []domain.WorkflowTask{
+			{ID: "t1", Title: "Inspect architecture", Description: "Inspect the repo", Status: domain.WorkflowTaskReady, OwnerAgent: domain.WorkflowAgentArchitecture},
+		},
+	}}
+	m := New(context.Background(), agent, false)
+	got, _, err := m.command("/plan")
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(got.transcript) == 0 || got.transcript[len(got.transcript)-1].Kind != entryAssistant {
+		t.Fatalf("transcript = %+v", got.transcript)
+	}
+	if got.pane != PaneChat {
+		t.Fatalf("pane should stay in chat, got %v", got.pane)
+	}
+}
+
 func TestViewShowsWelcomeAndComposer(t *testing.T) {
 	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "repo", session: "new", lazy: true}, false)
 	out := m.View()
@@ -181,14 +329,53 @@ func TestViewShowsWelcomeAndComposer(t *testing.T) {
 	if !strings.Contains(out, "╭") || !strings.Contains(out, "╰") {
 		t.Fatalf("view should render inside one outer frame: %q", out)
 	}
-	if !strings.Contains(out, "Live Stats") {
-		t.Fatalf("view missing live stats strip: %q", out)
-	}
 	if !strings.Contains(out, "companion cat") {
 		t.Fatalf("view missing companion badge: %q", out)
 	}
+	if strings.Contains(out, "session new") {
+		t.Fatalf("view should not show session badge anymore: %q", out)
+	}
+	if strings.Contains(out, "theme emerald") {
+		t.Fatalf("view should not show theme badge anymore: %q", out)
+	}
+	if strings.Contains(out, "lazy-tools") || strings.Contains(out, "eager-tools") {
+		t.Fatalf("view should not show lazy/eager tool badge anymore: %q", out)
+	}
 	if strings.Contains(out, "headroom=") {
 		t.Fatalf("default view should hide verbose budget details: %q", out)
+	}
+	if strings.Contains(out, "Chat pane focused") {
+		t.Fatalf("default view should not show the chat pane focused hint: %q", out)
+	}
+}
+
+func TestWelcomeBannerKeepsIndentedFirstLine(t *testing.T) {
+	out := renderWelcome(runtimeStatus{Model: "gemma4:e2b", Mode: "chat", Companion: "cat", Theme: "emerald", CWD: "repo", Session: "new"})
+	if !strings.Contains(out, "      /\\") {
+		t.Fatalf("welcome banner first line lost alignment: %q", out)
+	}
+}
+
+func TestComposerWidthFitsInnerFrame(t *testing.T) {
+	width := innerWidthFromFrame(72)
+	out := renderComposer("hi", nil, 0, PaneChat, width, false, "", false)
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("composer output too short: %q", out)
+	}
+	ruleWidth := lipgloss.Width(lines[0])
+	if ruleWidth != width {
+		t.Fatalf("composer rule width = %d, want %d", ruleWidth, width)
+	}
+}
+
+func TestComposerHelpUsesAltShortcuts(t *testing.T) {
+	out := renderComposer("hi", nil, 0, PaneChat, 40, false, "", false)
+	if !strings.Contains(out, "[alt+p] companion") || !strings.Contains(out, "[alt+t] theme") {
+		t.Fatalf("composer help missing alt shortcuts: %q", out)
+	}
+	if strings.Contains(out, "[f2]") || strings.Contains(out, "[f3]") {
+		t.Fatalf("composer help should not mention function keys: %q", out)
 	}
 }
 
@@ -247,6 +434,20 @@ func TestEnterAcceptsFirstSlashSuggestion(t *testing.T) {
 	}
 	got := next.(Model)
 	if got.input != "/sessions " {
+		t.Fatalf("input = %q", got.input)
+	}
+}
+
+func TestEnterAcceptsModeSuggestionFromPartialArgument(t *testing.T) {
+	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
+	m.input = "/mode ch"
+	m.updateSuggestions()
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("accepting a mode suggestion should not submit immediately")
+	}
+	got := next.(Model)
+	if got.input != "/mode chat" {
 		t.Fatalf("input = %q", got.input)
 	}
 }
@@ -623,6 +824,16 @@ func TestSelectedEntryShowsCopyHint(t *testing.T) {
 	}
 }
 
+func TestRenderEntryDoesNotUseHorizontalRules(t *testing.T) {
+	out := renderEntry(transcriptEntry{Kind: entryUser, Title: "you", Body: "hello"}, false, false)
+	if strings.Contains(out, "────") {
+		t.Fatalf("entry should not render horizontal rules anymore: %q", out)
+	}
+	if !strings.Contains(out, "you") || !strings.Contains(out, "hello") {
+		t.Fatalf("entry missing header/body: %q", out)
+	}
+}
+
 func TestCompanionCommandCyclesPersona(t *testing.T) {
 	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
 	first := m.pet.currentPersona().Name
@@ -638,14 +849,14 @@ func TestCompanionCommandCyclesPersona(t *testing.T) {
 	}
 }
 
-func TestF3CyclesTheme(t *testing.T) {
+func TestAltTCyclesTheme(t *testing.T) {
 	defer applyTheme(0)
 	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
 	first := m.themeIndex
-	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF3})
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t"), Alt: true})
 	got := next.(Model)
 	if got.themeIndex == first {
-		t.Fatalf("expected F3 to change theme from %d", first)
+		t.Fatalf("expected alt+t to change theme from %d", first)
 	}
 	if len(got.transcript) != 0 {
 		t.Fatalf("theme switch should not add transcript noise: %+v", got.transcript)
@@ -667,23 +878,37 @@ func TestThemeCommandSetsByName(t *testing.T) {
 	}
 }
 
-func TestViewShowsThemeBadge(t *testing.T) {
+func TestViewHidesThemeBadge(t *testing.T) {
 	defer applyTheme(0)
 	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "repo", session: "new"}, false)
-	if !strings.Contains(m.View(), "theme emerald") {
-		t.Fatalf("view missing theme badge")
+	if strings.Contains(m.View(), "theme emerald") {
+		t.Fatalf("view should not show theme badge")
 	}
 }
 
-func TestF2CyclesCompanion(t *testing.T) {
+func TestRenderWorkflowReplyUsesListStylePlan(t *testing.T) {
+	agent := &stubAgent{model: "gemma4:e2b", cwd: ".", session: "new"}
+	reply, err := agent.CoderSubmit(context.Background(), "Build coder mode")
+	if err != nil {
+		t.Fatalf("coder submit: %v", err)
+	}
+	if strings.Contains(reply.Text, "| Agent |") {
+		t.Fatalf("workflow summary should not use markdown table anymore: %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "## Capabilities Of Agents") || !strings.Contains(reply.Text, "## Plan") {
+		t.Fatalf("workflow summary missing expected sections: %q", reply.Text)
+	}
+}
+
+func TestAltPCyclesCompanion(t *testing.T) {
 	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
 	first := m.pet.currentPersona().Name
-	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF2})
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p"), Alt: true})
 	got := next.(Model)
 	if got.pet.currentPersona().Name == first {
-		t.Fatalf("expected F2 to change companion from %q", first)
+		t.Fatalf("expected alt+p to change companion from %q", first)
 	}
 	if len(got.transcript) != 0 {
-		t.Fatalf("F2 companion switch should not add transcript noise: %+v", got.transcript)
+		t.Fatalf("alt+p companion switch should not add transcript noise: %+v", got.transcript)
 	}
 }

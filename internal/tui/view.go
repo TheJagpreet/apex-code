@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/apex-code/apex/internal/domain"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -28,6 +29,14 @@ type Agent interface {
 	NewSession() error
 	SetModel(ctx context.Context, model string) error
 	ListSessions(ctx context.Context, limit int) ([]SessionOption, error)
+	Mode() string
+	SetMode(ctx context.Context, mode string) error
+	CoderSubmit(ctx context.Context, prompt string) (Reply, error)
+	CoderReview(ctx context.Context, feedback string) (Reply, error)
+	CoderApprove(ctx context.Context) (Reply, error)
+	CoderExecute(ctx context.Context) (Reply, error)
+	CoderExecuteStream(ctx context.Context, onUpdate func(Reply)) (Reply, error)
+	CoderWorkflow() *domain.CoderWorkflow
 }
 
 // Reply is one agent response rendered into the TUI.
@@ -39,6 +48,8 @@ type Reply struct {
 	ToolCalls   []ToolCallView
 	Diffs       []DiffView
 	Stats       string
+	Mode        string
+	Workflow    *domain.CoderWorkflow
 }
 
 // SessionOption is a compact session listing shown by the TUI.
@@ -136,22 +147,19 @@ type promptSpec struct {
 
 var slashCommands = []commandSpec{
 	{Name: "/help", Usage: "/help", Description: "show the command reference"},
-	{Name: "/pane", Usage: "/pane [chat|tools|diffs|context|stats|help]", Description: "switch the right-hand pane"},
-	{Name: "/pin", Usage: "/pin <file> [more files]", Description: "pin files into the visible working set list"},
-	{Name: "/unpin", Usage: "/unpin <file> [more files]", Description: "remove pinned files"},
 	{Name: "/explain", Usage: "/explain", Description: "insert the repo walkthrough starter"},
 	{Name: "/review", Usage: "/review", Description: "insert the code review starter"},
 	{Name: "/fix", Usage: "/fix", Description: "insert the debug and fix starter"},
 	{Name: "/test", Usage: "/test", Description: "insert the testing starter"},
-	{Name: "/model", Usage: "/model [name]", Description: "show or switch the active model"},
+	{Name: "/mode", Usage: "/mode [chat|coder]", Description: "show or switch the active interaction mode"},
+	{Name: "/plan", Usage: "/plan", Description: "show the current coder workflow plan"},
+	{Name: "/approve", Usage: "/approve", Description: "approve the current coder plan and start execution"},
+	{Name: "/replan", Usage: "/replan <feedback>", Description: "revise the current coder plan"},
 	{Name: "/resume", Usage: "/resume [id]", Description: "list sessions or resume a selected saved session"},
 	{Name: "/sessions", Usage: "/sessions", Description: "list recent sessions"},
 	{Name: "/new", Usage: "/new", Description: "start a clean session"},
-	{Name: "/stats", Usage: "/stats", Description: "focus the stats pane"},
-	{Name: "/prompts", Usage: "/prompts", Description: "list built-in prompt starters"},
 	{Name: "/companion", Usage: "/companion", Description: "switch the footer companion"},
 	{Name: "/theme", Usage: "/theme [name]", Description: "cycle or set the color theme"},
-	{Name: "/verbose", Usage: "/verbose", Description: "toggle expanded technical details"},
 	{Name: "/clear", Usage: "/clear", Description: "clear the visible transcript"},
 	{Name: "/quit", Usage: "/quit", Description: "exit apex-code"},
 }
@@ -184,6 +192,9 @@ var loaderPhrases = []string{
 // renderBudgetMeter draws the live token-budget meter. width is the number of
 // bar cells. Pure so it can be unit-tested.
 func renderBudgetMeter(b BudgetSnapshot, width int, verbose bool) string {
+	if b.PromptLimit <= 0 {
+		return styleDim.Render(fmt.Sprintf("context %d/infinity tok", b.PromptTokens))
+	}
 	if width < 4 {
 		width = 4
 	}
@@ -219,6 +230,10 @@ func renderBudgetMeter(b BudgetSnapshot, width int, verbose bool) string {
 	return out
 }
 
+func renderBudgetCompact(b BudgetSnapshot) string {
+	return fmt.Sprintf("tok %d", b.PromptTokens)
+}
+
 // renderPools renders the per-pool breakdown line.
 func renderPools(b BudgetSnapshot, verbose bool) string {
 	if !verbose {
@@ -236,7 +251,7 @@ func renderPools(b BudgetSnapshot, verbose bool) string {
 
 func renderWelcome(status runtimeStatus) string {
 	var b strings.Builder
-	b.WriteString(styleBanner.Render(strings.TrimSpace(apexASCII)))
+	b.WriteString(styleBanner.Render(strings.Trim(apexASCII, "\n")))
 	b.WriteString("\n")
 	b.WriteString(styleHeader.Render("A compact coding workspace for daily use"))
 	b.WriteString("\n")
@@ -345,26 +360,22 @@ func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
 	case entryAssistant:
 		body = renderMarkdown(body)
 	}
-	lineWidth := 72
-	ruleStyle := styleDim
 	titleStyle := styleHeader
 	switch entry.Kind {
 	case entryAssistant:
 		titleStyle = stylePaneTitle
 	case entryError:
 		titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))
-		ruleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	}
-	block := ruleStyle.Render(strings.Repeat("─", lineWidth))
+	block := ""
 	if selected {
 		title += "  " + styleDim.Render("[ctrl+y copy]")
 	}
-	block += "\n" + titleStyle.Render(title)
+	block += titleStyle.Render(title)
 	if verbose && entry.Meta != "" {
 		block += "\n" + styleDim.Render(entry.Meta)
 	}
 	block += "\n" + body
-	block += "\n" + ruleStyle.Render(strings.Repeat("─", lineWidth))
 	if selected {
 		return styleEntrySelected.Render(block)
 	}
@@ -373,16 +384,10 @@ func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
 
 func renderBadgeRow(status runtimeStatus) string {
 	badges := []string{
-		styleBadgeOn.Render("model " + status.Model),
+		styleBadgeOn.Render("mode " + status.Mode),
 		styleBadgeOn.Render("companion " + status.Companion),
-		styleBadgeOn.Render("theme " + status.Theme),
+		styleBadgeOff.Render(status.ContextSummary),
 		styleBadgeOff.Render("cwd " + status.CWD),
-		styleBadgeOff.Render("session " + status.Session),
-	}
-	if status.LazyTools {
-		badges = append(badges, styleBadgeOn.Render("lazy-tools"))
-	} else {
-		badges = append(badges, styleBadgeOff.Render("eager-tools"))
 	}
 	return strings.Join(badges, " ")
 }
@@ -503,14 +508,22 @@ func renderHelpPane() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, width int, verbose bool, copyStatus string) string {
+func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, width int, verbose bool, copyStatus string, working bool) string {
 	var b strings.Builder
 	rule := strings.Repeat("─", composerWidth(width))
-	b.WriteString(styleDim.Render(rule))
+	ruleStyle := styleComposerIdle
+	if working {
+		ruleStyle = styleComposerBusy
+	}
+	b.WriteString(ruleStyle.Render(rule))
 	b.WriteString("\n")
-	b.WriteString(input + "▌")
+	cursor := "▌"
+	if working {
+		cursor = ""
+	}
+	b.WriteString(input + cursor)
 	b.WriteString("\n")
-	b.WriteString(styleDim.Render(rule))
+	b.WriteString(ruleStyle.Render(rule))
 	if len(suggestions) > 0 {
 		b.WriteString("\n")
 		for i, s := range suggestions {
@@ -526,9 +539,9 @@ func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, 
 		}
 	}
 	b.WriteString("\n")
-	helpLine := "[enter] send  [ctrl+j] newline  [tab] accept  [up/down] select/history  [ctrl+y] copy message  [wheel/pgup/pgdn] scroll  [ctrl+c] cancel/quit  [esc] quit"
+	helpLine := "[ctrl+c] cancel/quit  [esc] quit  [alt+p] companion  [alt+t] theme"
 	if verbose {
-		helpLine = fmt.Sprintf("%s  [ctrl+o] pane(%s)", helpLine, pane)
+		helpLine = fmt.Sprintf("%s  [ctrl+y] copy  pane(%s)", helpLine, pane)
 	}
 	b.WriteString(styleDim.Render(helpLine))
 	if strings.TrimSpace(copyStatus) != "" {
@@ -539,7 +552,73 @@ func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, 
 }
 
 func renderStatusFooter(status runtimeStatus, pane Pane) string {
-	return styleDim.Render(fmt.Sprintf("provider=ollama  model=%s  session=%s  pane=%s  [f2] companion  [f3] theme", status.Model, status.Session, pane))
+	return ""
+}
+
+func renderPlanPane(wf *domain.CoderWorkflow) string {
+	if wf == nil {
+		return styleDim.Render("(no coder workflow yet)")
+	}
+	var b strings.Builder
+	b.WriteString(stylePaneTitle.Render("Coder Workflow"))
+	b.WriteString("\n")
+	b.WriteString(styleDim.Render(fmt.Sprintf("workflow=%s  state=%s  plan_version=%d  active_agent=%s", wf.ID, wf.State, wf.PlanVersion, wf.ActiveAgent)))
+	if strings.TrimSpace(wf.ActiveTaskID) != "" {
+		b.WriteString("\n")
+		b.WriteString(styleDim.Render("active task: " + wf.ActiveTaskID))
+	}
+	if len(wf.CompletedAgents) > 0 {
+		var chain []string
+		for _, item := range wf.CompletedAgents {
+			chain = append(chain, string(item))
+		}
+		b.WriteString("\n")
+		b.WriteString("agent chain: " + strings.Join(chain, " -> "))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(styleHelpHeader.Render("Plan Tasks"))
+	for _, task := range wf.Tasks {
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("[%s] %s (%s)", task.Status, task.Title, task.OwnerAgent))
+		if task.Phase != "" {
+			b.WriteString(styleDim.Render("  phase=" + task.Phase))
+		}
+		if strings.TrimSpace(task.Description) != "" {
+			b.WriteString("\n")
+			b.WriteString(task.Description)
+		}
+		if len(task.Dependencies) > 0 {
+			b.WriteString("\n")
+			b.WriteString(styleDim.Render("depends on: " + strings.Join(task.Dependencies, ", ")))
+		}
+	}
+	if len(wf.RunHistory) > 0 {
+		b.WriteString("\n\n")
+		b.WriteString(styleHelpHeader.Render("Recent Agent Runs"))
+		start := 0
+		if len(wf.RunHistory) > 4 {
+			start = len(wf.RunHistory) - 4
+		}
+		for _, run := range wf.RunHistory[start:] {
+			b.WriteString("\n")
+			b.WriteString(fmt.Sprintf("- %s  task=%s  %s", run.Agent, run.TaskID, run.Reason))
+			if strings.TrimSpace(run.Error) != "" {
+				b.WriteString("\n")
+				b.WriteString(styleDel.Render("  error: " + run.Error))
+			} else if strings.TrimSpace(run.Output) != "" {
+				b.WriteString("\n")
+				b.WriteString(styleDim.Render("  " + oneLine(run.Output)))
+			}
+		}
+	}
+	return b.String()
+}
+
+func renderPlanChat(wf *domain.CoderWorkflow) string {
+	if wf == nil {
+		return "(no coder workflow yet)"
+	}
+	return renderPlanPane(wf)
 }
 
 func renderStatsStrip(budget BudgetSnapshot, stats string, width int, verbose bool) string {
@@ -566,8 +645,8 @@ func renderLoader(frame, phrase int) string {
 
 func renderAppFrame(content string, width int) string {
 	frameWidth := width - 2
-	if frameWidth < 70 {
-		frameWidth = 70
+	if frameWidth < 20 {
+		frameWidth = 20
 	}
 	return styleAppFrame.Width(frameWidth).Render(content)
 }
@@ -599,12 +678,9 @@ func padRight(s string, width int) string {
 }
 
 func composerWidth(termWidth int) int {
-	w := termWidth - 2
-	if w < 24 {
-		return 24
-	}
-	if w > 140 {
-		return 140
+	w := termWidth
+	if w < 8 {
+		return 8
 	}
 	return w
 }

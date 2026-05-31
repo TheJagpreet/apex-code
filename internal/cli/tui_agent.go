@@ -3,9 +3,13 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/apex-code/apex/internal/agent"
+	"github.com/apex-code/apex/internal/codermode"
 	"github.com/apex-code/apex/internal/contextmgr"
 	"github.com/apex-code/apex/internal/domain"
 	"github.com/apex-code/apex/internal/provider/ollama"
@@ -23,10 +27,19 @@ type tuiAgent struct {
 	messages []domain.Message
 	seeded   bool
 	ensured  bool
+	mode     string
+	workflow *domain.CoderWorkflow
 }
 
 func newTUIAgent(ctx context.Context, deps *Deps) *tuiAgent {
-	return &tuiAgent{ctx: ctx, deps: deps, messages: cloneMessages(deps.Initial), seeded: len(deps.Initial) > 0}
+	agent := &tuiAgent{ctx: ctx, deps: deps, messages: cloneMessages(deps.Initial), seeded: len(deps.Initial) > 0, mode: "chat"}
+	if deps.Coder != nil {
+		if wf, ok, err := deps.Coder.LatestBySession(ctx, deps.SessionID); err == nil && ok {
+			agent.workflow = &wf
+			agent.mode = "coder"
+		}
+	}
+	return agent
 }
 
 func (a *tuiAgent) Model() string { return a.deps.cfg.Model }
@@ -51,6 +64,34 @@ func (a *tuiAgent) SessionLabel() string {
 }
 
 func (a *tuiAgent) LazyTools() bool { return a.deps.cfg.LazyTools }
+
+func (a *tuiAgent) Mode() string {
+	if strings.TrimSpace(a.mode) == "" {
+		return "chat"
+	}
+	return a.mode
+}
+
+func (a *tuiAgent) SetMode(_ context.Context, mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", "chat":
+		a.mode = "chat"
+	case "coder":
+		a.mode = "coder"
+	default:
+		return fmt.Errorf("unknown mode %q", mode)
+	}
+	return nil
+}
+
+func (a *tuiAgent) CoderWorkflow() *domain.CoderWorkflow {
+	if a.workflow == nil {
+		return nil
+	}
+	wf := *a.workflow
+	return &wf
+}
 
 func (a *tuiAgent) Send(ctx context.Context, prompt string) (tui.Reply, error) {
 	return a.run(ctx, prompt, nil)
@@ -96,6 +137,8 @@ func (a *tuiAgent) run(ctx context.Context, prompt string, onDelta func(string))
 		Budget:      budgetSnapshot(state.LastBudget),
 		ToolCalls:   toolCallViews(state.Turns),
 		Diffs:       diffViews(state.Turns),
+		Mode:        a.mode,
+		Workflow:    a.CoderWorkflow(),
 	}
 	if a.deps.Telemetry != nil {
 		if totals, err := a.deps.Telemetry.Totals(ctx, a.deps.effectiveSessionID()); err == nil {
@@ -114,6 +157,12 @@ func (a *tuiAgent) ResumeSession(ctx context.Context, selector string) error {
 	}
 	a.messages = cloneMessages(a.deps.Initial)
 	a.seeded = len(a.messages) > 0
+	if a.deps.Coder != nil {
+		if wf, ok, err := a.deps.Coder.LatestBySession(ctx, a.deps.SessionID); err == nil && ok {
+			a.workflow = &wf
+			a.mode = "coder"
+		}
+	}
 	return nil
 }
 
@@ -122,6 +171,8 @@ func (a *tuiAgent) NewSession() error {
 	a.deps.Initial = nil
 	a.messages = nil
 	a.seeded = false
+	a.workflow = nil
+	a.mode = "chat"
 	return nil
 }
 
@@ -158,6 +209,310 @@ func (a *tuiAgent) ListSessions(ctx context.Context, limit int) ([]tui.SessionOp
 	return out, nil
 }
 
+func (a *tuiAgent) CoderSubmit(ctx context.Context, prompt string) (tui.Reply, error) {
+	if a.deps.Coder == nil {
+		return tui.Reply{}, fmt.Errorf("coder mode is unavailable")
+	}
+	wf, err := a.deps.Coder.CreatePlan(ctx, a.deps.effectiveSessionID(), prompt)
+	if err != nil {
+		if latest, ok, loadErr := a.deps.Coder.LatestBySession(ctx, a.deps.effectiveSessionID()); loadErr == nil && ok {
+			a.workflow = &latest
+			a.mode = "coder"
+			if a.deps.Workflows != nil {
+				return tui.Reply{}, fmt.Errorf("%v\nWorkflow JSON: %s", err, a.deps.Workflows.WorkflowPath(latest))
+			}
+		}
+		return tui.Reply{}, err
+	}
+	a.workflow = &wf
+	a.mode = "coder"
+	location := ""
+	if a.deps.Workflows != nil {
+		location = a.deps.Workflows.WorkflowPath(wf)
+	}
+	text := "Drafted a coder workflow plan. Review it in the plan pane, then use /approve, /replan, or /runplan."
+	text = renderWorkflowChatSummary(wf, "Drafted a coder workflow plan. Review it below, then use `/approve` to approve and start execution, or `/replan <feedback>` to revise it.")
+	if strings.TrimSpace(location) != "" {
+		text += "\nWorkflow JSON: " + location
+	}
+	return tui.Reply{
+		Text:     text,
+		Budget:   a.coderBudget(ctx, wf),
+		Stats:    wfSummary(wf),
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}, nil
+}
+
+func (a *tuiAgent) CoderReview(ctx context.Context, feedback string) (tui.Reply, error) {
+	if a.workflow == nil {
+		return tui.Reply{}, fmt.Errorf("no active coder workflow")
+	}
+	wf, err := a.deps.Coder.RevisePlan(ctx, *a.workflow, feedback)
+	if err != nil {
+		return tui.Reply{}, err
+	}
+	a.workflow = &wf
+	return tui.Reply{
+		Text:     renderWorkflowChatSummary(wf, "Planner revised the workflow. Updated plan below. Use `/approve` to approve and start execution, or `/replan <feedback>` to revise it again."),
+		Budget:   a.coderBudget(ctx, wf),
+		Stats:    wfSummary(wf),
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}, nil
+}
+
+func (a *tuiAgent) CoderApprove(ctx context.Context) (tui.Reply, error) {
+	if a.workflow == nil {
+		return tui.Reply{}, fmt.Errorf("no active coder workflow")
+	}
+	wf, err := a.deps.Coder.ApprovePlan(ctx, *a.workflow)
+	if err != nil {
+		return tui.Reply{}, err
+	}
+	a.workflow = &wf
+	return tui.Reply{
+		Text:     renderWorkflowChatSummary(wf, "Plan approved. The workflow is ready for execution."),
+		Budget:   a.coderBudget(ctx, wf),
+		Stats:    wfSummary(wf),
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}, nil
+}
+
+func (a *tuiAgent) CoderExecute(ctx context.Context) (tui.Reply, error) {
+	if a.workflow == nil {
+		return tui.Reply{}, fmt.Errorf("no active coder workflow")
+	}
+	wf, err := a.deps.Coder.Execute(ctx, *a.workflow)
+	a.workflow = &wf
+	if err != nil {
+		return tui.Reply{
+			Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution stopped with an error: "+err.Error()),
+			Budget:   a.coderBudget(ctx, wf),
+			Stats:    wfSummary(wf),
+			Mode:     a.mode,
+			Workflow: a.CoderWorkflow(),
+		}, nil
+	}
+	reply := tui.Reply{
+		Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution updated: "+string(wf.State)),
+		Budget:   a.coderBudget(ctx, wf),
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}
+	reply.Stats = wfSummary(wf)
+	return reply, nil
+}
+
+func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Reply)) (tui.Reply, error) {
+	if a.workflow == nil {
+		return tui.Reply{}, fmt.Errorf("no active coder workflow")
+	}
+	wf, err := a.deps.Coder.ExecuteStream(ctx, *a.workflow, func(event codermode.ProgressEvent) {
+		a.workflow = &event.Workflow
+		if onUpdate == nil {
+			return
+		}
+		onUpdate(tui.Reply{
+			Text:     renderWorkflowProgressEvent(event),
+			Budget:   a.coderBudget(ctx, event.Workflow),
+			Stats:    wfSummary(event.Workflow),
+			Mode:     a.mode,
+			Workflow: a.CoderWorkflow(),
+		})
+	})
+	a.workflow = &wf
+	if err != nil {
+		return tui.Reply{
+			Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution stopped with an error: "+err.Error()),
+			Budget:   a.coderBudget(ctx, wf),
+			Stats:    wfSummary(wf),
+			Mode:     a.mode,
+			Workflow: a.CoderWorkflow(),
+		}, nil
+	}
+	return tui.Reply{
+		Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution completed."),
+		Budget:   a.coderBudget(ctx, wf),
+		Stats:    wfSummary(wf),
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}, nil
+}
+
+func wfSummary(wf domain.CoderWorkflow) string {
+	done := 0
+	for _, task := range wf.Tasks {
+		if task.Status == domain.WorkflowTaskDone {
+			done++
+		}
+	}
+	return fmt.Sprintf("coder workflow  state=%s  progress=%d/%d  plan_version=%d", wf.State, done, len(wf.Tasks), wf.PlanVersion)
+}
+
+func renderWorkflowChatSummary(wf domain.CoderWorkflow, intro string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(intro))
+	b.WriteString("\n\n")
+	b.WriteString(fmt.Sprintf("State: `%s`  Plan version: `%d`\n\n", wf.State, wf.PlanVersion))
+	if len(wf.Tasks) > 0 {
+		b.WriteString("## Plan\n\n")
+		for i, task := range wf.Tasks {
+			desc := strings.TrimSpace(task.Description)
+			if desc == "" {
+				desc = task.Title
+			}
+			b.WriteString(fmt.Sprintf("%d. `%s` -> %s\n", i+1, task.OwnerAgent, desc))
+			if len(task.Dependencies) > 0 {
+				b.WriteString(fmt.Sprintf("   depends on: %s\n", strings.Join(task.Dependencies, ", ")))
+			}
+			b.WriteString(fmt.Sprintf("   status: `%s`\n", task.Status))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func renderWorkflowExecutionSummary(wf domain.CoderWorkflow, intro string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(intro))
+	b.WriteString("\n\n")
+	b.WriteString(fmt.Sprintf("State: `%s`  Plan version: `%d`\n", wf.State, wf.PlanVersion))
+	b.WriteString("\n")
+	b.WriteString("## Session\n\n")
+	b.WriteString(fmt.Sprintf("  session_id: %s\n", fallbackSession(wf.SessionID)))
+	b.WriteString(fmt.Sprintf("  workflow_id: %s\n", wf.ID))
+	b.WriteString("\n")
+	b.WriteString("## Input\n\n")
+	b.WriteString("  user:\n")
+	b.WriteString(indentBlock(strings.TrimSpace(wf.UserPrompt), "    "))
+	b.WriteString("\n")
+	b.WriteString("  enriched:\n")
+	b.WriteString(indentBlock(firstNonEmpty(strings.TrimSpace(wf.EnrichedPrompt), "(not enriched)"), "    "))
+	b.WriteString("\n\n")
+	b.WriteString("## Tasks Performed\n\n")
+	b.WriteString("  ")
+	b.WriteString(agentRunChain(wf))
+	b.WriteString("\n\n")
+	b.WriteString("## Totals\n\n")
+	b.WriteString(fmt.Sprintf("  input_tokens: %d\n", workflowPromptTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  output_tokens: %d\n", workflowCompletionTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  total_tokens: %d\n", workflowTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  time_taken: %s\n", workflowDuration(wf)))
+	return strings.TrimSpace(b.String())
+}
+
+func renderWorkflowProgressEvent(event codermode.ProgressEvent) string {
+	switch event.Kind {
+	case "started":
+		if strings.TrimSpace(event.TaskTitle) != "" {
+			return fmt.Sprintf("%s is running: %s", colorAgent(event.Agent), strings.TrimSpace(event.TaskTitle))
+		}
+		return fmt.Sprintf("%s is running", colorAgent(event.Agent))
+	case "failed":
+		if strings.TrimSpace(event.Error) != "" {
+			return fmt.Sprintf("%s failed: %s", colorAgent(event.Agent), strings.TrimSpace(event.Error))
+		}
+		return fmt.Sprintf("%s failed", colorAgent(event.Agent))
+	default:
+		return ""
+	}
+}
+
+func runSummary(run domain.WorkflowAgentRun) string {
+	if strings.TrimSpace(run.Error) != "" {
+		return "error: " + strings.TrimSpace(run.Error)
+	}
+	if strings.TrimSpace(run.Output) != "" {
+		return compactLine(strings.TrimSpace(run.Output))
+	}
+	return ""
+}
+
+func workflowTokenTotal(wf domain.CoderWorkflow) int {
+	total := 0
+	for _, run := range wf.RunHistory {
+		total += run.TotalTokens
+	}
+	return total
+}
+
+func workflowPromptTokenTotal(wf domain.CoderWorkflow) int {
+	total := 0
+	for _, run := range wf.RunHistory {
+		total += run.PromptTokens
+	}
+	return total
+}
+
+func workflowCompletionTokenTotal(wf domain.CoderWorkflow) int {
+	total := 0
+	for _, run := range wf.RunHistory {
+		total += run.CompletionTokens
+	}
+	return total
+}
+
+func workflowDuration(wf domain.CoderWorkflow) string {
+	if wf.CreatedAt.IsZero() || wf.UpdatedAt.IsZero() || wf.UpdatedAt.Before(wf.CreatedAt) {
+		return "n/a"
+	}
+	return wf.UpdatedAt.Sub(wf.CreatedAt).Round(time.Millisecond).String()
+}
+
+func colorAgent(agent domain.WorkflowAgent) string {
+	switch agent {
+	case domain.WorkflowAgentOrchestrator:
+		return "`orchestrator`"
+	case domain.WorkflowAgentPlanner:
+		return "`planner`"
+	case domain.WorkflowAgentArchitecture:
+		return "`architecture`"
+	case domain.WorkflowAgentSolutioner:
+		return "`solutioner`"
+	case domain.WorkflowAgentTester:
+		return "`tester`"
+	case domain.WorkflowAgentReviewer:
+		return "`reviewer`"
+	default:
+		return "`" + string(agent) + "`"
+	}
+}
+
+func fallbackSession(sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return "ad-hoc"
+	}
+	return strings.TrimSpace(sessionID)
+}
+
+func agentRunChain(wf domain.CoderWorkflow) string {
+	if len(wf.RunHistory) == 0 {
+		return "(no agent runs recorded yet)"
+	}
+	parts := make([]string, 0, len(wf.RunHistory))
+	for _, run := range wf.RunHistory {
+		label := string(run.Agent)
+		if strings.Contains(strings.ToLower(run.Reason), "revise plan") {
+			label += " (replan)"
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func indentBlock(text string, indent string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return indent
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = indent + strings.TrimSpace(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func budgetSnapshot(r agent.BudgetReport) tui.BudgetSnapshot {
 	names := make([]string, 0, len(r.TokensByPool))
 	for name := range r.TokensByPool {
@@ -180,6 +535,33 @@ func budgetSnapshot(r agent.BudgetReport) tui.BudgetSnapshot {
 		OutputHeadroom: r.OutputHeadroom,
 		Pools:          pools,
 	}
+}
+
+func (a *tuiAgent) coderBudget(ctx context.Context, wf domain.CoderWorkflow) tui.BudgetSnapshot {
+	if a.deps == nil || a.deps.Provider == nil {
+		return tui.BudgetSnapshot{}
+	}
+	caps := a.deps.Provider.Capabilities()
+	totalTokens := workflowTokenTotal(wf)
+	if totalTokens == 0 {
+		content := workflowBudgetText(wf)
+		counted, err := a.deps.Provider.CountTokens(ctx, []domain.Message{{
+			Role:    domain.RoleSystem,
+			Content: content,
+		}})
+		if err == nil {
+			totalTokens = counted
+		}
+	}
+	return tui.BudgetSnapshot{
+		PromptTokens:   totalTokens,
+		PromptLimit:    caps.ContextWindow,
+		OutputHeadroom: caps.MaxOutputTokens,
+	}
+}
+
+func workflowBudgetText(wf domain.CoderWorkflow) string {
+	return codermode.WorkflowBudgetText(wf)
 }
 
 func toolCallViews(turns []agent.Turn) []tui.ToolCallView {
@@ -238,4 +620,15 @@ func summarizeSession(record session.Record) string {
 		return record.Title
 	}
 	return record.Termination
+}
+
+func compactLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = strings.TrimSpace(s[:i]) + " …"
+	}
+	if len(s) > 120 {
+		s = s[:120] + " …"
+	}
+	return s
 }

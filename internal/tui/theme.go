@@ -33,6 +33,7 @@ var themes = []theme{
 // theme switch takes effect on the next frame across the whole UI.
 var (
 	styleAppFrame      lipgloss.Style
+	styleConversationFrame lipgloss.Style
 	styleHeader        lipgloss.Style
 	styleBanner        lipgloss.Style
 	styleDim           lipgloss.Style
@@ -53,6 +54,8 @@ var (
 	styleHelpUsage     lipgloss.Style
 	styleRef           lipgloss.Style
 	stylePet           lipgloss.Style
+	styleComposerIdle  lipgloss.Style
+	styleComposerBusy  lipgloss.Style
 
 	styleScrollThumb lipgloss.Style
 	styleScrollTrack lipgloss.Style
@@ -80,6 +83,7 @@ func applyTheme(i int) {
 	c := func(code string) lipgloss.Color { return lipgloss.Color(code) }
 
 	styleAppFrame = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c(t.Border)).Padding(1, 2)
+	styleConversationFrame = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c(t.Border))
 	styleHeader = lipgloss.NewStyle().Bold(true).Foreground(c(t.Primary))
 	styleBanner = lipgloss.NewStyle().Bold(true).Foreground(c(t.Primary))
 	styleDim = lipgloss.NewStyle().Foreground(c(t.Dim))
@@ -100,6 +104,8 @@ func applyTheme(i int) {
 	styleHelpUsage = lipgloss.NewStyle().Foreground(c(t.Bright))
 	styleRef = lipgloss.NewStyle().Bold(true).Foreground(c(t.Secondary))
 	stylePet = lipgloss.NewStyle().Foreground(c(t.Accent))
+	styleComposerIdle = lipgloss.NewStyle().Foreground(c(t.Primary))
+	styleComposerBusy = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
 
 	styleScrollThumb = lipgloss.NewStyle().Foreground(c(t.Primary))
 	styleScrollTrack = lipgloss.NewStyle().Foreground(c(t.Border))

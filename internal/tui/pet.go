@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/harmonica"
 )
 
@@ -25,6 +26,7 @@ const (
 
 // petWidth is the reserved cell budget for the pet glyph plus a small emote.
 const petWidth = 8
+const petSidePadding = 3
 
 type petPersona struct {
 	Name     string
@@ -77,7 +79,7 @@ type petState struct {
 }
 
 func (p petState) maxX(width int) int {
-	m := width - petWidth - 2
+	m := width - petWidth - (petSidePadding * 2)
 	if m < 1 {
 		return 1
 	}
@@ -184,14 +186,29 @@ func (p petState) pickMood(maxX int) petState {
 
 // render draws the pet at its current position with the mood's face.
 func (p petState) render(width int, working bool) string {
+	face := p.face(working)
+	faceWidth := lipgloss.Width(face)
+	if faceWidth < 1 {
+		faceWidth = 1
+	}
 	pos := int(p.pos + 0.5)
 	if pos < 0 {
 		pos = 0
 	}
-	if m := p.maxX(width); pos > m {
-		pos = m
+	maxPos := width - faceWidth - petSidePadding
+	if maxPos < 0 {
+		maxPos = 0
 	}
-	return stylePet.Render(strings.Repeat(" ", pos) + p.face(working))
+	if m := p.maxX(width); maxPos > m {
+		maxPos = m
+	}
+	if pos < petSidePadding {
+		pos = petSidePadding
+	}
+	if pos > maxPos {
+		pos = maxPos
+	}
+	return strings.Repeat(" ", pos) + stylePet.Render(face)
 }
 
 // face returns the mood-driven emoji cat for the current frame.

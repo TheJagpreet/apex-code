@@ -31,6 +31,7 @@ treats context as the scarcest resource.
 
 - **Local-first.** Runs against Ollama models on your machine. No API keys, no egress.
 - **Token-efficient.** A budget-aware context manager keeps prompts small and predictable.
+- **Workflow-aware.** Coder mode can turn larger jobs into a persisted, reviewable plan.
 - **Polished TUI.** A real terminal workspace, not a logline firehose.
 - **Transparent.** Every token, tool call, and patch is inspectable.
 
@@ -41,6 +42,7 @@ treats context as the scarcest resource.
 - [Features](#features)
   - [Feature snapshots](#feature-snapshots)
   - [Interactive TUI workspace](#interactive-tui-workspace)
+  - [Coder mode](#coder-mode)
   - [Streaming output with the weave animation](#streaming-output-with-the-weave-animation)
   - [Color themes](#color-themes)
   - [Footer companion](#footer-companion)
@@ -87,6 +89,9 @@ go build -o apex ./cmd/apex
 # interactive TUI
 ./apex
 
+# inside the TUI, switch to planner-backed coder mode
+# /mode coder
+
 # one-shot prompt
 ./apex "explain the architecture of this repo"
 
@@ -115,12 +120,33 @@ runs one-shot, and piped stdin is folded into the prompt. Force either direction
 A full Bubble Tea workspace rather than a scrolling log:
 
 - Branded landing banner that collapses into a compact header once a chat begins.
+- Mode switching between the normal chat flow and a new JSON-driven **coder mode**.
 - A height-bounded, scrollable transcript with a live **scrollbar** (mouse wheel,
   `PgUp`/`PgDn`, `Home`/`End`, and arrow keys when the composer is empty).
 - **Markdown rendering** of assistant replies (headings, lists, bold, inline code).
 - Inspection **panes** you can cycle with `Tab`/`ctrl+o`: tools, diffs, context,
-  stats, and help.
+  stats, help, and the coder plan.
 - A live **stats strip** with the token-budget meter, always in view.
+- Fast workspace shortcuts: `Shift+Enter` for multiline input, `alt+p` to cycle
+  the companion, and `alt+t` to cycle themes.
+
+### Coder mode
+
+Coder mode adds a workflow-oriented execution path for longer coding jobs:
+
+- `/mode coder` switches the session into coder mode.
+- Your prompt is first routed through an **orchestrator** and **planner**.
+- The planner produces a saved workflow JSON plus a human-readable plan pane.
+- You can inspect the plan, use `/replan <feedback>` to revise it, `/approve` to
+  accept it and begin execution, or `/runplan` to continue an already approved
+  workflow.
+- Execution is delegated across specialized roles such as `architecture`,
+  `solutioner`, `tester`, and `reviewer`.
+- Workflow state, task status, active agent, and recent agent runs are persisted
+  and restored on session resume.
+
+Workflow files are stored as JSON next to the local state database, so the plan
+and execution trace remain inspectable outside the TUI too.
 
 ### Streaming output with the weave animation
 
@@ -134,8 +160,8 @@ per animation tick.)
 ### Color themes
 
 Re-skin the entire workspace at runtime, the same way you swap the companion. Cycle
-themes with `f3` or `/theme`, or jump straight to one with `/theme <name>`. The active
-theme is shown as a badge in the header. Built-in palettes:
+themes with `alt+t` or `/theme`, or jump straight to one with `/theme <name>`.
+Built-in palettes:
 
 `emerald` (default) · `ocean` · `sunset` · `grape` · `mono`
 
@@ -143,7 +169,7 @@ theme is shown as a badge in the header. Built-in palettes:
 
 A small spring-animated pet wanders the footer, naps while the agent is working, and
 wakes when it's done. Cycle through 12 personas (cat, fox, rabbit, dog, panda, bear,
-koala, tiger, lion, monkey, frog, penguin) with `f2` or `/companion`.
+koala, tiger, lion, monkey, frog, penguin) with `alt+p` or `/companion`.
 
 ### Slash commands & @file references
 
@@ -154,11 +180,16 @@ relative paths.
 | Command | What it does |
 |---|---|
 | `/help` | Command reference |
-| `/pane [name]` | Switch the right-hand pane (chat/tools/diffs/context/stats/help) |
-| `/pin` · `/unpin` | Pin/unpin files into the visible working set |
 | `/explain` `/review` `/fix` `/test` | Insert a prompt starter |
 | `/model [name]` | Show or switch the active model |
+| `/mode [chat|coder]` | Show or switch the active interaction mode |
+| `/plan` | Print the current coder workflow plan into chat |
+| `/approve` | Approve the current coder-mode plan and start execution |
+| `/replan <feedback>` | Ask the planner to revise the current plan |
+| `/runplan` | Continue executing the current approved workflow |
 | `/resume [id]` · `/sessions` · `/new` | Session management |
+| `/pane [name]` | Switch the auxiliary pane (`chat`, `tools`, `diffs`, `context`, `stats`, `help`, `plan`) |
+| `/pin` · `/unpin` | Pin/unpin files into the visible working set |
 | `/stats` | Focus the stats pane |
 | `/prompts` | List prompt starters |
 | `/companion` | Switch the footer companion |
@@ -216,6 +247,9 @@ latest or a specific session with `-resume latest` / `-resume <id>`, or from ins
 TUI with `/resume`. List recent sessions with `apex sessions` or `/sessions`, and start
 a clean window with `/new`.
 
+Coder-mode workflows are persisted separately as JSON and automatically reattached
+when a resumed session has recent workflow state.
+
 ### Telemetry & tracing
 
 Every turn is recorded to the local state DB across multiple dimensions:
@@ -260,6 +294,9 @@ apex-code reads configuration from flags and environment variables (flags win).
 `APEX_BUDGET_SYSTEM` · `APEX_BUDGET_TOOLS` · `APEX_BUDGET_HISTORY` ·
 `APEX_BUDGET_RETRIEVED` · `APEX_BUDGET_WORKING_FILES` · `APEX_BUDGET_OUTPUT_HEADROOM`
 
+By default, coder-mode workflow files live in a sibling `workflows/` directory
+next to the configured state DB.
+
 ## CLI reference
 
 ```
@@ -276,6 +313,7 @@ cmd/apex            entrypoint
 internal/cli        flag parsing, modes, dependency wiring
 internal/tui        Bubble Tea workspace (view, model, themes, pet, streaming)
 internal/agent      the agent loop, budgeting, compaction
+internal/codermode  JSON workflow store + orchestrator/planner/execution engine
 internal/provider   model backends (ollama, plus openai/anthropic/fake adapters)
 internal/contextmgr budget-aware context assembly
 internal/tools      built-in + MCP + dynamic/lazy tool registry

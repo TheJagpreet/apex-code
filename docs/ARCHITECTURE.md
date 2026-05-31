@@ -23,6 +23,7 @@ At a high level, the application is layered like this:
 CLI / TUI
   -> dependency wiring
   -> agent loop
+  -> coder-mode workflow engine
   -> context manager + prompt assembler
   -> provider layer + tool dispatcher
   -> retrieval / diff / persistence subsystems
@@ -75,6 +76,20 @@ Contains the orchestration loop:
 
 This is the execution engine that turns a user request into one or more model
 turns plus real tool actions.
+
+### `internal/codermode`
+
+Owns the workflow-oriented "coder mode" runtime:
+
+- workflow JSON schema persistence
+- orchestrator prompt enrichment
+- planner plan generation
+- plan revision and approval flow
+- specialized task execution across architecture / solutioner / tester / reviewer roles
+- workflow resume keyed by session id
+
+This package sits above the normal agent loop and uses it as a lower-level
+execution primitive for role-specific task work.
 
 ### `internal/provider`
 
@@ -211,6 +226,10 @@ Before a conversation runs, the CLI/deps layer creates:
 
 Interactive mode keeps these messages alive across turns via `tuiAgent`.
 
+Coder mode uses a separate bootstrap path: the user prompt is first converted
+into a persisted workflow JSON document, then execution only begins after the
+plan enters review and is approved.
+
 ### 3. Prompt preparation
 
 For each iteration, the agent loop:
@@ -248,6 +267,19 @@ placed back into the conversation.
 Tool results are appended as a tool-role message and the loop repeats. If the
 assistant returns no further tool calls, the final answer is emitted to either
 the TUI or stdout.
+
+### 7. Coder-mode workflow loop
+
+When the TUI session is in coder mode:
+
+1. The orchestrator enriches the user request and persists a new workflow file.
+2. The planner emits a strict JSON plan made of phases and tasks.
+3. The user reviews that plan in the TUI plan pane and can approve or request
+   replanning.
+4. After approval, the coder engine picks the next runnable task from the
+   workflow graph and invokes the matching specialized role.
+5. Each role writes its structured result back into workflow history and may
+   request replanning if the current flow is no longer appropriate.
 
 ## Token-efficiency architecture
 

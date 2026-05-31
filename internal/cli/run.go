@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/apex-code/apex/internal/agent"
+	"github.com/apex-code/apex/internal/codermode"
 	"github.com/apex-code/apex/internal/config"
 	"github.com/apex-code/apex/internal/contextmgr"
 	"github.com/apex-code/apex/internal/domain"
@@ -34,6 +35,7 @@ type Config struct {
 	Prompt        string
 	CWD           string
 	StateDBPath   string
+	WorkflowRoot  string
 	Resume        string
 	Features      config.Features
 	MCPServers    []config.MCPServer
@@ -52,6 +54,8 @@ type Deps struct {
 	Sessions   *session.Store
 	Telemetry  *telemetry.Store
 	Collector  *telemetry.Collector
+	Workflows  *codermode.Store
+	Coder      *codermode.Engine
 	SessionID  string
 	Initial    []domain.Message
 	cfg        Config
@@ -101,6 +105,16 @@ func BuildDeps(cfg Config) (*Deps, error) {
 		}
 		deps.Telemetry = store
 	}
+	workflowRoot := cfg.WorkflowRoot
+	if strings.TrimSpace(workflowRoot) == "" {
+		workflowRoot = filepath.Join(filepathDir(cfg.StateDBPath), "workflows")
+	}
+	wfStore, err := codermode.OpenStore(workflowRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open workflow store: %w", err)
+	}
+	deps.Workflows = wfStore
+	deps.Coder = codermode.NewEngine(client, deps.Dispatcher, wfStore, deps.Options)
 	if cfg.Features.MCP {
 		for _, server := range cfg.MCPServers {
 			if !server.Enabled || strings.TrimSpace(server.Command) == "" {
