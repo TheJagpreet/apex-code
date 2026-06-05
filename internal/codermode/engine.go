@@ -11,6 +11,7 @@ import (
 	"github.com/apex-code/apex/internal/agent"
 	"github.com/apex-code/apex/internal/domain"
 	"github.com/apex-code/apex/internal/provider"
+	"github.com/apex-code/apex/internal/telemetry"
 )
 
 type ProgressEvent struct {
@@ -20,6 +21,7 @@ type ProgressEvent struct {
 	TaskTitle string
 	Summary  string
 	Error    string
+	Budget   agent.BudgetReport
 	Workflow domain.CoderWorkflow
 }
 
@@ -28,10 +30,15 @@ type Engine struct {
 	tools    agent.ToolDispatcher
 	store    *Store
 	options  func() agent.Options
+	telemetrySink func(context.Context, telemetry.SessionEvent) error
 }
 
 func NewEngine(p provider.Provider, tools agent.ToolDispatcher, store *Store, options func() agent.Options) *Engine {
 	return &Engine{provider: p, tools: tools, store: store, options: options}
+}
+
+func (e *Engine) SetTelemetrySink(sink func(context.Context, telemetry.SessionEvent) error) {
+	e.telemetrySink = sink
 }
 
 func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (domain.CoderWorkflow, error) {
@@ -231,7 +238,7 @@ func (e *Engine) execute(ctx context.Context, wf domain.CoderWorkflow, onProgres
 				return wf, err
 			}
 		}
-		updated, err := e.executeTask(ctx, wf, task)
+		updated, err := e.executeTask(ctx, wf, task, onProgress)
 		if err != nil {
 			wf.Tasks[idx].Status = domain.WorkflowTaskBlocked
 			wf.State = domain.WorkflowStateFailed
@@ -305,13 +312,28 @@ func (e *Engine) runOrchestrator(ctx context.Context, wf domain.CoderWorkflow) (
 		PlannerInstructions string `json:"planner_instructions"`
 	}
 	out := orchestratorOutput{}
-	raw, err := e.runJSONTurn(ctx, []domain.Message{
+	raw, usage, stopReason, duration, err := e.runJSONTurn(ctx, []domain.Message{
 		{Role: domain.RoleSystem, Content: orchestratorPrompt},
 		{Role: domain.RoleUser, Content: wf.UserPrompt},
 	}, &out)
 	if err != nil {
 		return "", "", raw, err
 	}
+	e.recordTelemetry(ctx, telemetry.SessionEvent{
+		Mode:             "coder",
+		Kind:             "stage_llm",
+		Model:            "",
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		CacheCreation:    usage.CacheCreationTokens,
+		CacheRead:        usage.CacheReadTokens,
+		DurationMs:       duration.Milliseconds(),
+		Termination:      string(stopReason),
+		WorkflowID:       wf.ID,
+		Agent:            string(domain.WorkflowAgentOrchestrator),
+		Summary:          strings.TrimSpace(raw),
+	})
 	if strings.TrimSpace(out.EnrichedPrompt) == "" {
 		out.EnrichedPrompt = strings.TrimSpace(raw)
 	}
@@ -327,13 +349,28 @@ func (e *Engine) runPlanner(ctx context.Context, wf domain.CoderWorkflow, revisi
 	if strings.TrimSpace(revision) != "" {
 		input += "\n\nPlan revision request:\n" + strings.TrimSpace(revision)
 	}
-	raw, err := e.runJSONTurn(ctx, []domain.Message{
+	raw, usage, stopReason, duration, err := e.runJSONTurn(ctx, []domain.Message{
 		{Role: domain.RoleSystem, Content: plannerPrompt},
 		{Role: domain.RoleUser, Content: input},
 	}, &out)
 	if err != nil {
 		return domain.PlannerPlan{}, raw, input, err
 	}
+	e.recordTelemetry(ctx, telemetry.SessionEvent{
+		Mode:             "coder",
+		Kind:             "stage_llm",
+		Model:            "",
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		CacheCreation:    usage.CacheCreationTokens,
+		CacheRead:        usage.CacheReadTokens,
+		DurationMs:       duration.Milliseconds(),
+		Termination:      string(stopReason),
+		WorkflowID:       wf.ID,
+		Agent:            string(domain.WorkflowAgentPlanner),
+		Summary:          strings.TrimSpace(raw),
+	})
 	normalizePlannerPlan(&out)
 	for i := range out.Tasks {
 		if out.Tasks[i].Status == "" {
@@ -343,14 +380,44 @@ func (e *Engine) runPlanner(ctx context.Context, wf domain.CoderWorkflow, revisi
 	return out, raw, input, nil
 }
 
-func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task domain.WorkflowTask) (domain.CoderWorkflow, error) {
+func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task domain.WorkflowTask, onProgress func(ProgressEvent)) (domain.CoderWorkflow, error) {
 	systemPrompt := executionPrompt(task.OwnerAgent)
 	if systemPrompt == "" {
 		systemPrompt = solutionerPrompt
 	}
 	opts := e.options()
+	opts.OnTurn = func(turn agent.Turn, budget agent.BudgetReport, iteration, maxIterations int) {
+		e.recordTelemetry(ctx, telemetry.SessionEvent{
+			Mode:             "coder",
+			Kind:             "task_llm_turn",
+			Model:            "",
+			PromptTokens:     turn.Response.Usage.PromptTokens,
+			CompletionTokens: turn.Response.Usage.CompletionTokens,
+			TotalTokens:      turn.Response.Usage.TotalTokens,
+			CacheCreation:    turn.Response.Usage.CacheCreationTokens,
+			CacheRead:        turn.Response.Usage.CacheReadTokens,
+			DurationMs:       turn.Duration.Milliseconds(),
+			Termination:      string(turn.Response.StopReason),
+			WorkflowID:       wf.ID,
+			TaskID:           task.ID,
+			Agent:            string(task.OwnerAgent),
+			ToolCalls:        toolCallNames(turn.ToolCalls),
+			ToolResults:      len(turn.ToolResults),
+			Error:            errorString(turn.Err),
+			Summary:          strings.TrimSpace(turn.Response.Message.Content),
+		})
+		emitProgress(onProgress, ProgressEvent{
+			Kind:      "turn",
+			Agent:     task.OwnerAgent,
+			TaskID:    task.ID,
+			TaskTitle: task.Title,
+			Budget:    budget,
+			Workflow:  cloneWorkflow(wf),
+		})
+	}
 	messages := []domain.Message{
 		{Role: domain.RoleSystem, Content: systemPrompt},
+		{Role: domain.RoleSystem, Content: executionGuardPrompt},
 		{Role: domain.RoleSystem, Content: "Workflow execution context:\n" + taskExecutionContext(wf, task)},
 		{Role: domain.RoleUser, Content: fmt.Sprintf("Execute task %s: %s\n\nDescription:\n%s", task.ID, task.Title, task.Description)},
 	}
@@ -359,16 +426,16 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 	if err != nil {
 		return wf, err
 	}
+	state, err = e.finalizeExecutionState(ctx, task, systemPrompt, opts, state)
+	if err != nil {
+		return wf, err
+	}
 	completedAt := time.Now().UTC()
 	if state.FinalResponse == nil {
 		return wf, fmt.Errorf("task %s ended without a final response", task.ID)
 	}
-	var out executionOutput
 	raw := state.FinalResponse.Message.Content
-	if err := decodeJSONObject(raw, &out); err != nil {
-		out.Status = "done"
-		out.Summary = strings.TrimSpace(raw)
-	}
+	out := decodeExecutionDisposition(raw)
 	idx := findTaskIndex(wf, task.ID)
 	if idx >= 0 {
 		switch strings.ToLower(strings.TrimSpace(out.Status)) {
@@ -406,10 +473,14 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 			"turns":       len(state.Turns),
 			"termination": string(state.TerminationReason),
 			"summary":     out.Summary,
+			"status":      out.Status,
 		},
 		PromptTokens:     sumPromptTokens(state),
 		CompletionTokens: sumCompletionTokens(state),
 		TotalTokens:      sumTotalTokens(state),
+		BudgetPromptTokens: state.LastBudget.TotalPromptTokens,
+		BudgetPromptLimit: state.LastBudget.PromptLimit,
+		BudgetOutputHeadroom: state.LastBudget.OutputHeadroom,
 		DurationMs:       completedAt.Sub(startedAt).Milliseconds(),
 		StartedAt:        startedAt,
 		CompletedAt:      completedAt,
@@ -435,33 +506,145 @@ type executionOutput struct {
 	PlanMutations []domain.WorkflowMutation `json:"plan_mutations,omitempty"`
 }
 
-func (e *Engine) runJSONTurn(ctx context.Context, messages []domain.Message, target any) (string, error) {
+type executionDisposition struct {
+	Status        string
+	Summary       string
+	PlanMutations []domain.WorkflowMutation
+}
+
+func (e *Engine) finalizeExecutionState(ctx context.Context, task domain.WorkflowTask, systemPrompt string, opts agent.Options, state agent.LoopState) (agent.LoopState, error) {
+	if state.FinalResponse != nil || state.TerminationReason != agent.TerminationMaxIterations {
+		return state, nil
+	}
+	finalizeMessages := cloneDomainMessages(state.Messages)
+	finalizeInstruction := "Stop using tools now. Based only on the repository evidence already collected, return the final task result immediately as concise plain text. " +
+		"Do not inspect more files. Do not ask questions. If you have enough evidence for a best-effort task result, give the best concise summary you can. " +
+		"Prefix the response with 'BLOCKED:' only when a required external dependency, missing file, or tool failure truly prevents meaningful completion. " +
+		"Prefix the response with 'NEEDS_REPLAN:' only when the current plan is no longer viable."
+	if task.OwnerAgent == domain.WorkflowAgentSolutioner {
+		finalizeInstruction += " If this task required creating, editing, or deleting files and that change did not already happen through successful tool calls, do not claim success; instead respond with 'BLOCKED:' and explain what did not happen."
+	}
+	finalizeMessages = append(finalizeMessages, domain.Message{
+		Role: domain.RoleUser,
+		Content: finalizeInstruction,
+	})
+	finalizeOpts := opts
+	finalizeOpts.Tools = nil
+	finalizeOpts.ToolProvider = nil
+	finalizeOpts.MaxIterations = 2
+	finalizeOpts.StreamText = nil
+	finalizeState, err := agent.New(e.provider, nil).Run(ctx, finalizeMessages, finalizeOpts)
+	if err != nil {
+		return state, err
+	}
+	if finalizeState.FinalResponse == nil {
+		return state, fmt.Errorf("task %s ended without a final response after forced finalization (reason=%s)", task.ID, finalizeState.TerminationReason)
+	}
+	state.Iteration += finalizeState.Iteration
+	state.Messages = finalizeState.Messages
+	state.Turns = append(state.Turns, finalizeState.Turns...)
+	state.FinalResponse = finalizeState.FinalResponse
+	state.TerminationReason = finalizeState.TerminationReason
+	state.LastError = finalizeState.LastError
+	state.LastBudget = finalizeState.LastBudget
+	state.Phase = finalizeState.Phase
+	return state, nil
+}
+
+func decodeExecutionDisposition(raw string) executionDisposition {
+	var parsed executionOutput
+	if err := decodeJSONObject(raw, &parsed); err == nil {
+		status := strings.ToLower(strings.TrimSpace(parsed.Status))
+		if status == "" {
+			status = "done"
+		}
+		summary := strings.TrimSpace(parsed.Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(raw)
+		}
+		return executionDisposition{
+			Status:        status,
+			Summary:       summary,
+			PlanMutations: parsed.PlanMutations,
+		}
+	}
+	text := strings.TrimSpace(raw)
+	lower := strings.ToLower(text)
+	switch {
+	case strings.HasPrefix(lower, "blocked:"):
+		return executionDisposition{
+			Status:  "blocked",
+			Summary: strings.TrimSpace(text[len("blocked:"):]),
+		}
+	case strings.HasPrefix(lower, "needs_replan:"):
+		return executionDisposition{
+			Status:  "needs_replan",
+			Summary: strings.TrimSpace(text[len("needs_replan:"):]),
+		}
+	case strings.HasPrefix(lower, "replan:"):
+		return executionDisposition{
+			Status:  "needs_replan",
+			Summary: strings.TrimSpace(text[len("replan:"):]),
+		}
+	default:
+		return executionDisposition{
+			Status:  "done",
+			Summary: text,
+		}
+	}
+}
+
+func cloneDomainMessages(messages []domain.Message) []domain.Message {
+	out := make([]domain.Message, 0, len(messages))
+	for _, msg := range messages {
+		copied := domain.Message{
+			Role:         msg.Role,
+			Content:      msg.Content,
+			CacheControl: msg.CacheControl,
+		}
+		copied.ToolCalls = append([]domain.ToolCall(nil), msg.ToolCalls...)
+		copied.ToolResults = append([]domain.ToolResult(nil), msg.ToolResults...)
+		out = append(out, copied)
+	}
+	return out
+}
+
+func (e *Engine) runJSONTurn(ctx context.Context, messages []domain.Message, target any) (string, domain.Usage, domain.StopReason, time.Duration, error) {
+	started := time.Now()
 	stream, err := e.provider.Complete(ctx, domain.Request{
 		Model:    "",
 		Messages: messages,
 	})
 	if err != nil {
-		return "", err
+		return "", domain.Usage{}, domain.StopUnknown, 0, err
 	}
 	defer stream.Close()
 	var text strings.Builder
+	var usage domain.Usage
+	stopReason := domain.StopUnknown
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", domain.Usage{}, domain.StopUnknown, time.Since(started), err
 		}
 		if ev.Kind == provider.EventText {
 			text.WriteString(ev.Text)
 		}
+		if ev.Kind == provider.EventDone {
+			stopReason = ev.StopReason
+			if ev.Usage != nil {
+				usage = *ev.Usage
+			}
+		}
 	}
 	raw := strings.TrimSpace(text.String())
 	if err := decodeJSONObject(raw, target); err != nil {
-		return raw, err
+		return raw, usage, stopReason, time.Since(started), err
 	}
-	return raw, nil
+	return raw, usage, stopReason, time.Since(started), nil
 }
 
 func decodeJSONObject(raw string, target any) error {
@@ -691,34 +874,47 @@ You only return the planner stage payload.
 No markdown, no prose outside JSON.`
 
 const architecturePrompt = `You are the architecture agent in apex-code coder mode.
-Inspect the repository and answer in strict JSON with:
-- status: done | blocked | needs_replan
-- summary: concise explanation of architecture findings relevant to this task
-- plan_mutations: optional array
+Inspect the repository and answer with a concise plain-text task result.
+Once you have enough evidence to satisfy the task, stop and return the result immediately.
+Do not keep exploring after the acceptance criteria are satisfied.
+Avoid repeating the same tool call for the same file or line range unless a previous tool result failed.
+For analysis tasks, prefer a best-effort status=done summary once you can explain the main flow. Use blocked only for real external blockers.
+If the task is truly blocked, prefix the response with 'BLOCKED:'.
+If the task needs replanning, prefix the response with 'NEEDS_REPLAN:'.
 Use tools when the task depends on real repository state.`
+
+const executionGuardPrompt = `You are operating on a real workspace.
+Use tools for repository inspection, file edits, and command execution whenever the task depends on real workspace state.
+Never claim you changed a file, ran a command, or verified a fix unless the corresponding tool actually succeeded.
+For file edits, prefer read_file before edit or write_file, and summarize the actual tool outcomes.`
 
 const solutionerPrompt = `You are the solutioner agent in apex-code coder mode.
 Implement the task in the real workspace.
-Answer in strict JSON with:
-- status: done | blocked | needs_replan
-- summary: concise implementation result
-- plan_mutations: optional array
+Answer with a concise plain-text task result that reflects the real workspace outcome.
+Once the task is completed or concretely blocked, stop and return the result immediately.
+Avoid repeating the same tool call for the same file or line range unless a previous tool result failed.
+If the task is truly blocked, prefix the response with 'BLOCKED:'.
+If the task needs replanning, prefix the response with 'NEEDS_REPLAN:'.
 Use tools whenever edits, inspection, or verification require real state.`
 
 const testerPrompt = `You are the testing agent in apex-code coder mode.
 Run or select the right validations for the current task.
-Answer in strict JSON with:
-- status: done | blocked | needs_replan
-- summary: concise test result summary
-- plan_mutations: optional array
+Answer with a concise plain-text task result summarizing the validation outcome.
+Once you have enough validation evidence, stop and return the result immediately.
+Avoid repeating the same tool call for the same file or line range unless a previous tool result failed.
+Prefer status=done when you can report the best available validation result. Use blocked only for real external blockers.
+If the task is truly blocked, prefix the response with 'BLOCKED:'.
+If the task needs replanning, prefix the response with 'NEEDS_REPLAN:'.
 Use tools for commands and file inspection.`
 
 const reviewerPrompt = `You are the reviewer agent in apex-code coder mode.
 Review the produced work for bugs, regressions, and missing tests.
-Answer in strict JSON with:
-- status: done | blocked | needs_replan
-- summary: concise review findings
-- plan_mutations: optional array
+Answer with a concise plain-text task result summarizing the review findings.
+Once you have enough review evidence, stop and return the result immediately.
+Avoid repeating the same tool call for the same file or line range unless a previous tool result failed.
+Prefer status=done when you can deliver the best available review summary. Use blocked only for real external blockers.
+If the task is truly blocked, prefix the response with 'BLOCKED:'.
+If the task needs replanning, prefix the response with 'NEEDS_REPLAN:'.
 Use tools when real repository state is needed.`
 
 func executionPrompt(agentName domain.WorkflowAgent) string {
@@ -739,6 +935,13 @@ func emitProgress(onProgress func(ProgressEvent), event ProgressEvent) {
 		return
 	}
 	onProgress(event)
+}
+
+func (e *Engine) recordTelemetry(ctx context.Context, event telemetry.SessionEvent) {
+	if e.telemetrySink == nil {
+		return
+	}
+	_ = e.telemetrySink(ctx, event)
 }
 
 func latestTaskOutput(wf domain.CoderWorkflow, taskID string) string {
@@ -771,4 +974,21 @@ func sumTotalTokens(state agent.LoopState) int {
 		total += turn.Response.Usage.TotalTokens
 	}
 	return total
+}
+
+func toolCallNames(calls []domain.ToolCall) []string {
+	out := make([]string, 0, len(calls))
+	for _, call := range calls {
+		if strings.TrimSpace(call.Name) != "" {
+			out = append(out, strings.TrimSpace(call.Name))
+		}
+	}
+	return out
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

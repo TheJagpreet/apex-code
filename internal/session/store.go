@@ -2,17 +2,17 @@ package session
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/apex-code/apex/internal/contextmgr"
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
 )
 
 type Snapshot struct {
@@ -58,83 +58,38 @@ type Record struct {
 	UpdatedAt   int64
 }
 
+type sessionDocument struct {
+	Record   Record      `json:"record"`
+	Snapshot Snapshot    `json:"snapshot"`
+	Turns    []TurnRecord `json:"turns"`
+}
+
 type Store struct {
-	db *sql.DB
+	root string
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
+	root := sessionRoot(path)
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
-	if err := s.Init(context.Background()); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return s, nil
+	return &Store{root: root}, nil
 }
 
 func OpenMemory() (*Store, error) {
-	return Open(":memory:")
+	return Open(filepath.Join(os.TempDir(), "apex-session-memory-"+uuid.NewString()))
 }
 
-func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+func (s *Store) Close() error { return nil }
+
+func (s *Store) Init(_ context.Context) error {
+	if s == nil {
 		return nil
 	}
-	return s.db.Close()
+	return os.MkdirAll(s.root, 0o755)
 }
 
-func (s *Store) Init(ctx context.Context) error {
-	pragmas := []string{
-		`pragma busy_timeout = 5000`,
-		`pragma journal_mode = wal`,
-		`pragma synchronous = normal`,
-	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
-			return err
-		}
-	}
-	stmts := []string{
-		`create table if not exists sessions (
-			id text primary key,
-			title text not null,
-			model text not null,
-			cwd text not null,
-			prompt text not null,
-			termination text not null,
-			turn_count integer not null,
-			snapshot_json text not null,
-			created_at integer not null,
-			updated_at integer not null
-		)`,
-		`create table if not exists session_turns (
-			session_id text not null references sessions(id) on delete cascade,
-			turn_index integer not null,
-			prompt_tokens integer not null,
-			completion_tokens integer not null,
-			total_tokens integer not null,
-			stop_reason text not null,
-			tool_calls integer not null,
-			tool_results integer not null,
-			cache_creation_tokens integer not null,
-			cache_read_tokens integer not null,
-			error_text text not null,
-			saved_by_json text not null,
-			primary key(session_id, turn_index)
-		)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Store) Save(ctx context.Context, in SaveInput) (Record, Snapshot, error) {
+func (s *Store) Save(_ context.Context, in SaveInput) (Record, Snapshot, error) {
 	if in.Snapshot.Version == 0 {
 		in.Snapshot.Version = 1
 	}
@@ -144,171 +99,190 @@ func (s *Store) Save(ctx context.Context, in SaveInput) (Record, Snapshot, error
 	if in.Model != "" && in.Snapshot.Model == "" {
 		in.Snapshot.Model = in.Model
 	}
-	if in.SessionID == "" {
+	if strings.TrimSpace(in.SessionID) == "" {
 		in.SessionID = uuid.NewString()
 	}
 	now := time.Now().UnixNano()
 	record := Record{
 		ID:          in.SessionID,
 		Title:       summarizePrompt(in.Prompt),
-		Model:       in.Snapshot.Model,
-		CWD:         filepath.Clean(in.Snapshot.CWD),
+		Model:       firstNonEmpty(in.Snapshot.Model, in.Model),
+		CWD:         filepath.Clean(firstNonEmpty(in.Snapshot.CWD, in.CWD)),
 		Prompt:      strings.TrimSpace(in.Prompt),
 		Termination: in.Termination,
 		TurnCount:   len(in.Turns),
 		UpdatedAt:   now,
 	}
-	if record.Model == "" {
-		record.Model = in.Model
-	}
-	if record.CWD == "." && in.CWD != "" {
-		record.CWD = filepath.Clean(in.CWD)
-	}
-
-	snapJSON, err := json.Marshal(in.Snapshot)
-	if err != nil {
-		return Record{}, Snapshot{}, fmt.Errorf("marshal session snapshot: %w", err)
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
+	doc, err := s.readDocument(in.SessionID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Record{}, Snapshot{}, err
 	}
-	defer tx.Rollback()
-
-	err = tx.QueryRowContext(ctx, `select created_at from sessions where id = ?`, record.ID).Scan(&record.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
+	if doc.Record.CreatedAt > 0 {
+		record.CreatedAt = doc.Record.CreatedAt
+	} else {
 		record.CreatedAt = now
-		err = nil
 	}
-	if err != nil {
-		return Record{}, Snapshot{}, err
+	payload := sessionDocument{
+		Record:   record,
+		Snapshot: in.Snapshot,
+		Turns:    cloneTurns(in.Turns),
 	}
-
-	if _, err := tx.ExecContext(ctx, `insert into sessions(id, title, model, cwd, prompt, termination, turn_count, snapshot_json, created_at, updated_at)
-		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		on conflict(id) do update set
-			title=excluded.title,
-			model=excluded.model,
-			cwd=excluded.cwd,
-			prompt=excluded.prompt,
-			termination=excluded.termination,
-			turn_count=excluded.turn_count,
-			snapshot_json=excluded.snapshot_json,
-			updated_at=excluded.updated_at`,
-		record.ID, record.Title, record.Model, record.CWD, record.Prompt, record.Termination, record.TurnCount, string(snapJSON), record.CreatedAt, record.UpdatedAt); err != nil {
-		return Record{}, Snapshot{}, err
-	}
-
-	if _, err := tx.ExecContext(ctx, `delete from session_turns where session_id = ?`, record.ID); err != nil {
-		return Record{}, Snapshot{}, err
-	}
-	for _, turn := range in.Turns {
-		savedByJSON, err := json.Marshal(turn.SavedBy)
-		if err != nil {
-			return Record{}, Snapshot{}, fmt.Errorf("marshal turn savings: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `insert into session_turns(
-			session_id, turn_index, prompt_tokens, completion_tokens, total_tokens, stop_reason,
-			tool_calls, tool_results, cache_creation_tokens, cache_read_tokens, error_text, saved_by_json
-		) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			record.ID, turn.Index, turn.PromptTokens, turn.CompletionTokens, turn.TotalTokens, turn.StopReason,
-			turn.ToolCalls, turn.ToolResults, turn.CacheCreation, turn.CacheRead, turn.Error, string(savedByJSON)); err != nil {
-			return Record{}, Snapshot{}, err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
+	if err := s.writeDocument(payload); err != nil {
 		return Record{}, Snapshot{}, err
 	}
 	return record, in.Snapshot, nil
 }
 
-func (s *Store) Load(ctx context.Context, selector string) (Record, Snapshot, []TurnRecord, error) {
-	row, err := s.loadSessionRow(ctx, selector)
+func (s *Store) Load(_ context.Context, selector string) (Record, Snapshot, []TurnRecord, error) {
+	doc, err := s.loadDocument(selector)
 	if err != nil {
 		return Record{}, Snapshot{}, nil, err
 	}
-	record, snapJSON, err := scanSessionRow(row)
-	if err != nil {
-		return Record{}, Snapshot{}, nil, err
-	}
-	var snap Snapshot
-	if err := json.Unmarshal([]byte(snapJSON), &snap); err != nil {
-		return Record{}, Snapshot{}, nil, fmt.Errorf("decode session snapshot: %w", err)
-	}
-	turns, err := s.loadTurns(ctx, record.ID)
-	if err != nil {
-		return Record{}, Snapshot{}, nil, err
-	}
-	return record, snap, turns, nil
+	return doc.Record, doc.Snapshot, cloneTurns(doc.Turns), nil
 }
 
-func (s *Store) List(ctx context.Context, limit int) ([]Record, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := s.db.QueryContext(ctx, `select id, title, model, cwd, prompt, termination, turn_count, created_at, updated_at
-		from sessions order by updated_at desc limit ?`, limit)
+func (s *Store) List(_ context.Context, limit int) ([]Record, error) {
+	docs, err := s.listDocuments()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []Record
-	for rows.Next() {
-		var r Record
-		if err := rows.Scan(&r.ID, &r.Title, &r.Model, &r.CWD, &r.Prompt, &r.Termination, &r.TurnCount, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
+	sort.SliceStable(docs, func(i, j int) bool {
+		return docs[i].Record.UpdatedAt > docs[j].Record.UpdatedAt
+	})
+	if limit > 0 && len(docs) > limit {
+		docs = docs[:limit]
 	}
-	return out, rows.Err()
+	out := make([]Record, 0, len(docs))
+	for _, doc := range docs {
+		out = append(out, doc.Record)
+	}
+	return out, nil
 }
 
-func (s *Store) loadSessionRow(ctx context.Context, selector string) (*sql.Row, error) {
+func (s *Store) loadDocument(selector string) (sessionDocument, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" || strings.EqualFold(selector, "latest") {
-		return s.db.QueryRowContext(ctx, `select id, title, model, cwd, prompt, termination, turn_count, snapshot_json, created_at, updated_at
-			from sessions order by updated_at desc limit 1`), nil
+		docs, err := s.listDocuments()
+		if err != nil {
+			return sessionDocument{}, err
+		}
+		if len(docs) == 0 {
+			return sessionDocument{}, fmt.Errorf("session not found")
+		}
+		sort.SliceStable(docs, func(i, j int) bool {
+			return docs[i].Record.UpdatedAt > docs[j].Record.UpdatedAt
+		})
+		return docs[0], nil
 	}
-	return s.db.QueryRowContext(ctx, `select id, title, model, cwd, prompt, termination, turn_count, snapshot_json, created_at, updated_at
-		from sessions where id = ?`, selector), nil
+	return s.readDocument(selector)
 }
 
-func scanSessionRow(row *sql.Row) (Record, string, error) {
-	var rec Record
-	var snapshotJSON string
-	err := row.Scan(&rec.ID, &rec.Title, &rec.Model, &rec.CWD, &rec.Prompt, &rec.Termination, &rec.TurnCount, &snapshotJSON, &rec.CreatedAt, &rec.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Record{}, "", fmt.Errorf("session not found")
-	}
-	return rec, snapshotJSON, err
-}
-
-func (s *Store) loadTurns(ctx context.Context, sessionID string) ([]TurnRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `select turn_index, prompt_tokens, completion_tokens, total_tokens, stop_reason,
-		tool_calls, tool_results, cache_creation_tokens, cache_read_tokens, error_text, saved_by_json
-		from session_turns where session_id = ? order by turn_index`, sessionID)
+func (s *Store) listDocuments() ([]sessionDocument, error) {
+	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []TurnRecord
-	for rows.Next() {
-		var rec TurnRecord
-		var savedByJSON string
-		if err := rows.Scan(&rec.Index, &rec.PromptTokens, &rec.CompletionTokens, &rec.TotalTokens, &rec.StopReason,
-			&rec.ToolCalls, &rec.ToolResults, &rec.CacheCreation, &rec.CacheRead, &rec.Error, &savedByJSON); err != nil {
+	out := make([]sessionDocument, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		doc, err := s.readDocument(entry.Name())
+		if err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(savedByJSON) != "" {
-			_ = json.Unmarshal([]byte(savedByJSON), &rec.SavedBy)
-		}
-		out = append(out, rec)
+		out = append(out, doc)
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+func (s *Store) readDocument(sessionID string) (sessionDocument, error) {
+	data, err := os.ReadFile(s.sessionFile(sessionID))
+	if err != nil {
+		return sessionDocument{}, err
+	}
+	var doc sessionDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return sessionDocument{}, fmt.Errorf("decode session document: %w", err)
+	}
+	return doc, nil
+}
+
+func (s *Store) writeDocument(doc sessionDocument) error {
+	path := s.sessionFile(doc.Record.ID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode session document: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (s *Store) sessionFile(sessionID string) string {
+	return filepath.Join(s.root, sanitizeSessionID(sessionID), "session.json")
+}
+
+func sessionRoot(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return filepath.Join(".", "sessions")
+	}
+	clean := filepath.Clean(path)
+	if strings.EqualFold(filepath.Base(clean), "sessions") {
+		return clean
+	}
+	if filepath.Ext(clean) != "" {
+		return filepath.Join(filepath.Dir(clean), "sessions")
+	}
+	return filepath.Join(clean, "sessions")
+}
+
+func sanitizeSessionID(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "ad-hoc"
+	}
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := strings.Trim(strings.TrimSpace(b.String()), "_")
+	if out == "" {
+		return "ad-hoc"
+	}
+	return out
+}
+
+func cloneTurns(in []TurnRecord) []TurnRecord {
+	out := make([]TurnRecord, 0, len(in))
+	for _, turn := range in {
+		copied := turn
+		if len(turn.SavedBy) > 0 {
+			copied.SavedBy = make(map[string]int, len(turn.SavedBy))
+			for k, v := range turn.SavedBy {
+				copied.SavedBy[k] = v
+			}
+		}
+		out = append(out, copied)
+	}
+	return out
 }
 
 func summarizePrompt(prompt string) string {
@@ -320,4 +294,13 @@ func summarizePrompt(prompt string) string {
 		return prompt[:69] + "..."
 	}
 	return prompt
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

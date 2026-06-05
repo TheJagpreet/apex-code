@@ -10,6 +10,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/apex-code/apex/internal/agent"
 	"github.com/apex-code/apex/internal/provider/ollama"
+	"github.com/apex-code/apex/internal/provider/openai"
 )
 
 type Features struct {
@@ -27,8 +28,10 @@ type MCPServer struct {
 }
 
 type Settings struct {
+	Provider      string
 	Model         string
 	BaseURL       string
+	APIKey        string
 	MaxIterations int
 	LazyTools     bool
 	SkillRoots    []string
@@ -36,6 +39,7 @@ type Settings struct {
 	StateDBPath   string
 	Resume        string
 	Budget        agent.BudgetFractions
+	BudgetSet     bool
 	Features      Features
 	MCPServers    []MCPServer
 
@@ -44,8 +48,10 @@ type Settings struct {
 }
 
 type Partial struct {
+	Provider      *string
 	Model         *string
 	BaseURL       *string
+	APIKey        *string
 	MaxIterations *int
 	LazyTools     *bool
 	SkillRoots    []string
@@ -67,12 +73,16 @@ type BudgetPartial struct {
 }
 
 type fileConfig struct {
+	Provider      string        `toml:"provider"`
 	Model         string        `toml:"model"`
-	BaseURL       string        `toml:"ollama_url"`
+	BaseURL       string        `toml:"base_url"`
+	OllamaURL     string        `toml:"ollama_url"`
+	APIKey        string        `toml:"api_key"`
 	MaxIterations int           `toml:"max_iterations"`
 	LazyTools     *bool         `toml:"lazy_tools"`
 	SkillRoots    []string      `toml:"skills"`
 	DataDir       string        `toml:"data_dir"`
+	StatePath     string        `toml:"state_path"`
 	StateDBPath   string        `toml:"state_db"`
 	Resume        string        `toml:"resume"`
 	Budget        BudgetPartial `toml:"budget"`
@@ -104,11 +114,12 @@ func Resolve(cwd string, env map[string]string, flags Partial) (Settings, error)
 	applyPartial(&settings, flags)
 
 	settings.SkillRoots = cleanStrings(settings.SkillRoots)
+	settings.Provider = normalizeProvider(settings.Provider, settings.APIKey)
 	if settings.Model == "" {
-		settings.Model = ollama.DefaultModel
+		settings.Model = defaultModelForProvider(settings.Provider)
 	}
 	if settings.BaseURL == "" {
-		settings.BaseURL = ollama.DefaultBaseURL
+		settings.BaseURL = defaultBaseURLForProvider(settings.Provider)
 	}
 	if settings.MaxIterations <= 0 {
 		settings.MaxIterations = 50
@@ -117,21 +128,24 @@ func Resolve(cwd string, env map[string]string, flags Partial) (Settings, error)
 		settings.DataDir = filepath.Join(cwd, ".apex")
 	}
 	if settings.StateDBPath == "" {
-		settings.StateDBPath = filepath.Join(settings.DataDir, "apex.db")
+		settings.StateDBPath = filepath.Join(settings.DataDir, "state.json")
 	}
 	return settings, nil
 }
 
 func defaultSettings(cwd, projectConfig, userConfig string) Settings {
 	return Settings{
-		Model:             ollama.DefaultModel,
-		BaseURL:           ollama.DefaultBaseURL,
+		Provider:          "auto",
+		Model:             "",
+		BaseURL:           "",
+		APIKey:            "",
 		MaxIterations:     50,
 		LazyTools:         false,
 		SkillRoots:        []string{filepath.Join(cwd, ".apex", "skills")},
 		DataDir:           filepath.Join(cwd, ".apex"),
-		StateDBPath:       filepath.Join(cwd, ".apex", "apex.db"),
+		StateDBPath:       filepath.Join(cwd, ".apex", "state.json"),
 		Budget:            agent.DefaultBudgetFractions(),
+		BudgetSet:         false,
 		Features:          Features{Sessions: true, Telemetry: true, MCP: true},
 		ProjectConfigPath: projectConfig,
 		UserConfigPath:    userConfig,
@@ -155,14 +169,21 @@ func loadPartial(path string) (Partial, error) {
 		return out, fmt.Errorf("decode %s: %w", path, err)
 	}
 	baseDir := filepath.Dir(path)
+	baseURL := cfg.BaseURL
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = cfg.OllamaURL
+	}
+	statePath := firstNonEmpty(cfg.StatePath, cfg.StateDBPath)
 	return Partial{
+		Provider:      stringPtr(cfg.Provider),
 		Model:         stringPtr(cfg.Model),
-		BaseURL:       stringPtr(cfg.BaseURL),
+		BaseURL:       stringPtr(baseURL),
+		APIKey:        stringPtr(cfg.APIKey),
 		MaxIterations: intPtr(cfg.MaxIterations),
 		LazyTools:     cfg.LazyTools,
 		SkillRoots:    resolvePaths(baseDir, cfg.SkillRoots),
 		DataDir:       pathPtr(baseDir, cfg.DataDir),
-		StateDBPath:   pathPtr(baseDir, cfg.StateDBPath),
+		StateDBPath:   pathPtr(baseDir, statePath),
 		Resume:        stringPtr(cfg.Resume),
 		Budget:        budgetPtr(cfg.Budget),
 		Features:      &cfg.Features,
@@ -172,8 +193,15 @@ func loadPartial(path string) (Partial, error) {
 
 func partialFromEnv(env map[string]string) Partial {
 	out := Partial{}
+	out.Provider = stringPtr(firstNonEmpty(env["APEX_PROVIDER"], env["APEX_MODEL_PROVIDER"]))
 	out.Model = stringPtr(env["APEX_MODEL"])
-	out.BaseURL = stringPtr(env["APEX_OLLAMA_URL"])
+	out.BaseURL = stringPtr(firstNonEmpty(
+		env["APEX_BASE_URL"],
+		env["APEX_OPENAI_BASE_URL"],
+		env["OPENAI_BASE_URL"],
+		env["APEX_OLLAMA_URL"],
+	))
+	out.APIKey = stringPtr(firstNonEmpty(env["APEX_API_KEY"], env["OPENAI_API_KEY"]))
 	out.Resume = stringPtr(env["APEX_RESUME"])
 	if v, ok := parseInt(env["APEX_MAX_ITERATIONS"]); ok {
 		out.MaxIterations = &v
@@ -185,7 +213,7 @@ func partialFromEnv(env map[string]string) Partial {
 		out.SkillRoots = splitPaths(v)
 	}
 	out.DataDir = stringPtr(env["APEX_DATA_DIR"])
-	out.StateDBPath = stringPtr(env["APEX_STATE_DB"])
+	out.StateDBPath = stringPtr(firstNonEmpty(env["APEX_STATE_PATH"], env["APEX_STATE_DB"]))
 	if bp := budgetFromEnv(env); bp != nil {
 		out.Budget = bp
 	}
@@ -193,11 +221,17 @@ func partialFromEnv(env map[string]string) Partial {
 }
 
 func applyPartial(settings *Settings, partial Partial) {
+	if partial.Provider != nil {
+		settings.Provider = normalizeProvider(*partial.Provider, settings.APIKey)
+	}
 	if partial.Model != nil && strings.TrimSpace(*partial.Model) != "" {
 		settings.Model = strings.TrimSpace(*partial.Model)
 	}
 	if partial.BaseURL != nil && strings.TrimSpace(*partial.BaseURL) != "" {
 		settings.BaseURL = strings.TrimSpace(*partial.BaseURL)
+	}
+	if partial.APIKey != nil {
+		settings.APIKey = strings.TrimSpace(*partial.APIKey)
 	}
 	if partial.MaxIterations != nil && *partial.MaxIterations > 0 {
 		settings.MaxIterations = *partial.MaxIterations
@@ -219,6 +253,7 @@ func applyPartial(settings *Settings, partial Partial) {
 	}
 	if partial.Budget != nil {
 		applyBudget(&settings.Budget, *partial.Budget)
+		settings.BudgetSet = true
 	}
 	if partial.Features != nil {
 		settings.Features = *partial.Features
@@ -371,4 +406,47 @@ func intPtr(v int) *int {
 		return nil
 	}
 	return &v
+}
+
+func normalizeProvider(providerName, apiKey string) string {
+	switch strings.ToLower(strings.TrimSpace(providerName)) {
+	case "", "auto":
+		if strings.TrimSpace(apiKey) != "" {
+			return "openai"
+		}
+		return "ollama"
+	case "openai":
+		return "openai"
+	case "ollama":
+		return "ollama"
+	default:
+		return strings.ToLower(strings.TrimSpace(providerName))
+	}
+}
+
+func defaultModelForProvider(providerName string) string {
+	switch normalizeProvider(providerName, "") {
+	case "openai":
+		return "gpt-4o-mini"
+	default:
+		return ollama.DefaultModel
+	}
+}
+
+func defaultBaseURLForProvider(providerName string) string {
+	switch normalizeProvider(providerName, "") {
+	case "openai":
+		return openai.DefaultBaseURL
+	default:
+		return ollama.DefaultBaseURL
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

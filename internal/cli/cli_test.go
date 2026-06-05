@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/apex-code/apex/internal/agent"
@@ -52,6 +54,29 @@ func TestSplitRoots(t *testing.T) {
 	}
 	if got := splitRoots("a"); len(got) != 1 || got[0] != "a" {
 		t.Fatalf("single root parse failed: %v", got)
+	}
+}
+
+func TestLoadDotEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte(`
+# comment
+APEX_PROVIDER=openai
+OPENAI_API_KEY="sk-test"
+export APEX_MODEL=gpt-4.1-mini
+`), 0o644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	env := loadDotEnv(path)
+	if env["APEX_PROVIDER"] != "openai" {
+		t.Fatalf("provider = %q", env["APEX_PROVIDER"])
+	}
+	if env["OPENAI_API_KEY"] != "sk-test" {
+		t.Fatalf("api key = %q", env["OPENAI_API_KEY"])
+	}
+	if env["APEX_MODEL"] != "gpt-4.1-mini" {
+		t.Fatalf("model = %q", env["APEX_MODEL"])
 	}
 }
 

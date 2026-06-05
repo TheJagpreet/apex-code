@@ -1,424 +1,401 @@
 # apex-code Architecture
 
-This document describes how `apex-code` is structured today: the runtime layers,
-how a request flows through the system, where token efficiency is enforced, and
-which subsystems are responsible for editing, retrieval, persistence, and UI.
+This document describes how `apex-code` is structured today: how configuration
+is resolved, how prompts move through the runtime, how tool use and coder mode
+work, and where token budgeting and compaction are enforced.
 
-## Design goals
+## Design principles
 
-`apex-code` is built around a few constraints:
+`apex-code` is built around a few practical constraints:
 
-- It should work well with small, local models, especially through Ollama.
-- It should spend as few tokens as possible on deterministic work.
-- It should keep the prompt window curated instead of replaying the entire chat.
-- It should remain portable as a single Go binary with local state in SQLite.
+- It should run as a single local Go binary.
+- It should work with multiple providers through one shared adapter interface.
+- It should spend tokens on model reasoning, not deterministic plumbing.
+- It should treat context as curated state, not an append-only transcript.
+- It should keep real workspace actions inspectable through tools, diffs, and telemetry.
 
-Those goals shape nearly every package in the repo.
+## Runtime overview
 
-## System overview
-
-At a high level, the application is layered like this:
+At a high level, the runtime looks like this:
 
 ```text
 CLI / TUI
+  -> config resolution + provider selection
   -> dependency wiring
   -> agent loop
-  -> coder-mode workflow engine
-  -> context manager + prompt assembler
-  -> provider layer + tool dispatcher
-  -> retrieval / diff / persistence subsystems
-  -> SQLite-backed session, cache, and telemetry state
+  -> prompt assembly + budgeting
+  -> provider stream
+  -> tool execution
+  -> context compaction / persistence / telemetry
 ```
 
-The main entrypoint lives in `cmd/apex`, while most of the implementation sits
-under `internal/`.
+Coder mode adds one more layer on top:
 
-## Top-level package map
+```text
+user prompt
+  -> orchestrator enrichment
+  -> planner JSON workflow
+  -> user review / approve
+  -> task execution via role-specific agent runs
+  -> workflow persistence + TUI plan pane
+```
+
+## Configuration flow
+
+Configuration is resolved in this order:
+
+1. CLI flags
+2. Process environment variables
+3. Project-local `.env`
+4. Project `apex.toml`
+5. User config `apex.toml`
+6. Built-in defaults
+
+Important current behavior:
+
+- Provider selection defaults to `openai` if an API key is present and no provider
+  is forced.
+- Otherwise it defaults to `ollama`.
+- Budgeting also has two modes:
+  - no explicit `APEX_BUDGET_*` values: use most of the model window automatically
+  - explicit `APEX_BUDGET_*` values: enforce pool-based budgeting
+
+The config logic lives primarily in:
+
+- `internal/config`
+- `internal/cli`
+
+## Package map
 
 ### `cmd/apex`
 
-The binary entrypoint. It hands off immediately to the CLI package.
+Binary entrypoint. It immediately hands off to `internal/cli`.
 
 ### `internal/cli`
 
-Responsible for:
+The composition root for the application.
 
-- parsing flags and choosing interactive, one-shot, or pipe mode
-- resolving config and feature flags
-- constructing providers, tool registries, sessions, telemetry, and skills
-- adapting the dependency graph to the TUI agent interface
+Responsibilities:
 
-This package is the composition root for the app.
-
-### `internal/tui`
-
-Implements the Bubble Tea terminal workspace:
-
-- transcript rendering
-- slash commands and `@file` completion
-- tool, diff, context, stats, and help panes
-- streaming assistant output effects
-- footer companion and themes
-- transcript message selection and clipboard copy support
-
-The TUI is a view/controller layer. It does not own agent logic directly.
-
-### `internal/agent`
-
-Contains the orchestration loop:
-
-- request assembly
-- provider invocation
-- tool-call execution
-- observation of tool results
-- termination rules
-- budget accounting and prompt preparation
-
-This is the execution engine that turns a user request into one or more model
-turns plus real tool actions.
-
-### `internal/codermode`
-
-Owns the workflow-oriented "coder mode" runtime:
-
-- workflow JSON schema persistence
-- orchestrator prompt enrichment
-- planner plan generation
-- plan revision and approval flow
-- specialized task execution across architecture / solutioner / tester / reviewer roles
-- workflow resume keyed by session id
-
-This package sits above the normal agent loop and uses it as a lower-level
-execution primitive for role-specific task work.
+- parse flags
+- resolve config
+- choose one-shot / pipe / TUI mode
+- build the provider, tool registry, session store, telemetry store, workflow store,
+  and context manager
+- adapt the runtime into the TUI-facing agent interface
 
 ### `internal/provider`
 
-Defines the provider abstraction and concrete model backends:
+Defines the provider abstraction used everywhere else.
+
+Current adapters:
 
 - `ollama`
 - `openai`
 - `anthropic`
 - `fake`
-- `sse`
 
-All providers normalize completions, streaming events, tool calls, token usage,
-and stop reasons into shared domain types so the agent loop can stay provider
-agnostic.
+Every provider maps vendor-specific streaming responses into the shared event model:
+
+- text deltas
+- tool calls
+- usage updates
+- stop reasons
+
+This is the main reason chat mode and coder mode are supposed to behave consistently:
+they share the same provider interface and agent loop.
 
 ### `internal/domain`
 
-Holds core shared types such as messages, tool calls/results, requests, and
-responses. This package provides the contract between the agent loop, providers,
-and tools.
+Shared contracts used across the app:
+
+- messages
+- tool calls
+- tool results
+- requests
+- responses
+- usage
+- coder workflow structures
+
+### `internal/agent`
+
+The core execution loop.
+
+Responsibilities:
+
+- assemble each request
+- enforce max iterations
+- stream model output
+- dispatch tool calls
+- append tool results back into the conversation
+- terminate with final answer / max iterations / error / user cancel
+- enforce prompt budgeting before each provider call
+
+The agent loop is used both by normal chat and by coder-mode task execution.
 
 ### `internal/contextmgr`
 
-Implements prompt compaction and curated context assembly. This is one of the
-most important token-efficiency layers in the repository.
+Curates the model window from messages instead of replaying everything forever.
 
-Its responsibilities include:
+Responsibilities:
 
-- tracking a working set derived from messages and tool activity
-- rendering a bounded prompt from named token pools
-- compacting oversized prompts
-- summarizing or eliding stale context
-- enforcing output headroom
+- convert messages into a working set
+- measure prompt size
+- elide duplicates
+- digest stale tool results
+- summarize older history
+- evict low-priority context until the prompt fits
+- return a compacted message list back to the agent loop
+
+This is the implementation behind the compactor hook used by the agent.
 
 ### `internal/promptasm`
 
-Builds the actual provider request from the current system messages, history,
-latest user turn, fresh tool results, and tool schemas.
+Deterministically assembles provider requests from:
 
-This package focuses on deterministic prompt layout and stable ordering so the
-prefix remains as cache-friendly as possible.
+- system messages
+- tool descriptors / schemas
+- older history
+- latest user message
+- fresh tool messages
+
+It keeps stable prompt sections ahead of volatile ones so the structure is predictable.
 
 ### `internal/tools`
 
-Contains the built-in tool system:
+Owns the built-in tool system:
 
-- registry and dispatcher
-- lazy tool/schema loading
-- tool routing
-- safety/result gating
-- concrete tools such as `read_file`, `write_file`, `edit`, `grep`, `glob`,
-  `list_dir`, `run`, `fetch`, and MCP wrappers
+- registry
+- dispatcher
+- lazy tool activation
+- MCP wrapping
+- output/result shaping
 
-The tools package is designed to keep raw tool output small, structured, and
-useful before it ever re-enters model context.
+Built-in tools currently include file reads/writes/edits, search, shell execution,
+directory listing, globbing, and URL fetch.
 
-### `internal/diffengine`
+### `internal/codermode`
 
-Handles targeted edits safely:
+Implements workflow-backed coding mode.
 
-- anchor-based hunk application
-- fuzzy matching fallback
-- rollback on failure
-- verification hooks
-- filtered failure reporting
+Responsibilities:
 
-It allows the model to propose small edits rather than rewriting whole files.
+- create workflow JSON from a user prompt
+- run orchestrator enrichment
+- run planner JSON generation
+- support replan / approve / execute
+- execute tasks through role-specific prompts
+- persist workflow state and run history
 
-### `internal/repoindex`
+Coder mode does not bypass the normal runtime. It uses the same provider + tool
+infrastructure, but wraps it in a higher-level workflow state machine.
 
-Provides repository indexing and retrieval support:
+### `internal/tui`
 
-- filesystem walking
-- symbol extraction
-- outline-first retrieval
-- incremental indexing
-- SQLite-backed storage for search and map generation
+Implements the Bubble Tea interface:
 
-This subsystem helps the agent orient within a repo without stuffing large files
-into context by default.
+- transcript rendering
+- streaming weave effect
+- panes for tools, diffs, stats, context, help, and plan
+- slash commands
+- `@file` completion
+- themes and footer companion
+- session and model controls
 
 ### `internal/session`
 
-Persists curated sessions and their working-set snapshots. Resume is based on
-reconstructing compact state, not replaying the full raw transcript.
+Persists session records and compact working-set snapshots so resume restores a
+curated state rather than replaying every raw turn.
 
 ### `internal/telemetry`
 
-Stores token, cache, and latency metrics in SQLite and powers:
+Stores append-only, file-backed session telemetry and powers `apex stats`.
 
-- `apex stats`
-- per-session rollups
-- per-model rollups
-- recent trace views
-- token-savings accounting
+### `internal/repoindex`
 
-### `internal/skills`
-
-Discovers and activates skill bundles that can advertise additional prompt
-fragments or tool sets without eagerly inflating the prompt.
+Supports repository walking and indexing for file-aware interaction and completion.
 
 ### `internal/mcp`
 
-Implements the Model Context Protocol client integration used to expose external
-tool servers through the same tool abstraction as native tools.
+Wraps Model Context Protocol servers so external tools can join the same tool path
+as native tools.
 
-### `internal/tokenizer`
+### `internal/skills`
 
-Provides token counting implementations and heuristics so budget checks can be
-performed before provider calls are made.
+Discovers and activates skill bundles that can add context or tool capability without
+eagerly inflating the prompt.
 
-## Runtime flow
+## Request flow
 
-### 1. Startup and mode selection
+### 1. Startup
 
-`internal/cli` determines whether the process should run as:
-
-- interactive TUI
-- one-shot prompt execution
-- piped stdin execution
-- stats / sessions / MCP utility subcommands
-
-It then builds the dependency graph: provider, tool registry, dispatcher,
-context manager, session store, telemetry store, skill loader, and lazy tool
-router.
+The CLI resolves config, loads `.env` if present, selects the provider, and builds
+the dependency graph.
 
 ### 2. Conversation seeding
 
-Before a conversation runs, the CLI/deps layer creates:
+The runtime seeds:
 
-- the base system instruction
-- optional lazy tool catalogue text
-- optional session state restored from persistence
+- base system instructions
+- lazy tool catalogue if enabled
+- resumed session state if requested
 
-Interactive mode keeps these messages alive across turns via `tuiAgent`.
+### 3. Request assembly
 
-Coder mode uses a separate bootstrap path: the user prompt is first converted
-into a persisted workflow JSON document, then execution only begins after the
-plan enters review and is approved.
+Before each provider call, the agent loop:
 
-### 3. Prompt preparation
+- optionally refreshes lazy tool schemas
+- assembles messages through `promptasm`
+- measures prompt size
+- builds a budget from provider caps + runtime options
 
-For each iteration, the agent loop:
+### 4. Budget check
 
-- asks the tool provider for the currently advertised tool schemas
-- assembles a structured provider request via `promptasm`
-- counts/measures token usage
-- checks the result against configured budget pools
+If the prompt is too large:
 
-If the request exceeds the prompt budget, the context manager compacts it before
-the provider is called.
+- the compactor runs
+- the context manager tries to shrink the prompt
+- the agent retries assembly
 
-### 4. Model execution
+If repeated compaction still cannot fit the prompt, the run stops with budget exhaustion.
 
-The selected provider streams back events:
+### 5. Provider call
 
-- assistant text deltas
+The provider streams back:
+
+- text
 - tool calls
-- usage updates
-- completion/stop signals
+- usage
+- done events
 
-The loop collects these into a normalized response.
+### 6. Tool execution
 
-### 5. Tool execution
+If tool calls are emitted:
 
-If tool calls are present, the dispatcher resolves each tool by name and invokes
-it through the native tool interface.
+- the dispatcher resolves each tool
+- tool results are compacted through the tool result format/gate
+- results are appended as `tool` messages
+- the loop continues
 
-Each tool returns a compact `Result` that is already filtered through the shared
-gate. That means long outputs are trimmed, summarized, or tailed before they are
-placed back into the conversation.
+### 7. Final answer or workflow step completion
 
-### 6. Observation and continuation
+If no more tool calls are emitted:
 
-Tool results are appended as a tool-role message and the loop repeats. If the
-assistant returns no further tool calls, the final answer is emitted to either
-the TUI or stdout.
+- normal chat returns a final response
+- coder mode records the task result into workflow history
 
-### 7. Coder-mode workflow loop
+## Budgeting model
 
-When the TUI session is in coder mode:
+Budgeting now has two distinct modes.
 
-1. The orchestrator enriches the user request and persists a new workflow file.
-2. The planner emits a strict JSON plan made of phases and tasks.
-3. The user reviews that plan in the TUI plan pane and can approve or request
-   replanning.
-4. After approval, the coder engine picks the next runnable task from the
-   workflow graph and invokes the matching specialized role.
-5. Each role writes its structured result back into workflow history and may
-   request replanning if the current flow is no longer appropriate.
+### Default mode: near-full-window
 
-## Token-efficiency architecture
+If no `APEX_BUDGET_*` values are explicitly configured:
 
-Token efficiency is not isolated to one package. It is enforced across several
-layers:
+- apex uses almost the entire provider context window
+- it reserves only a modest output headroom
+- it does not enforce strict pool splits
 
-### Budgeted prompt pools
+This is the current default because it behaves better for larger repo-analysis tasks.
 
-The agent loop and context manager divide the prompt into named pools such as:
+### Explicit mode: pool-based budgeting
 
-- system
-- tools
-- history
-- retrieved context
-- working files
-- output headroom
+If one or more `APEX_BUDGET_*` values are configured:
 
-This prevents any single class of context from consuming the entire window.
+- apex divides the context window into named pools:
+  - system
+  - tools
+  - history
+  - retrieved context
+  - working files
+  - output headroom
+- each pool gets a fraction of the total window
+- prompt assembly is checked against both total prompt limit and pool limits
 
-### Curated working set
+This mode is better when you want predictable shaping across turns.
 
-The context manager treats context as a reconstructed view, not a raw append-only
-log. Older or less useful information can be digested, summarized, or evicted.
+## What the compactor is
 
-### Tool output gating
+The compactor is the shrinking step used when a request is too large.
 
-Native tool output is never blindly dumped back into context. The tools layer
-caps output size and returns compact summaries.
+In practice, it is the `contextmgr.Compactor`, which:
 
-### Outline-first retrieval
+- rebuilds a working set from the current messages
+- rewrites stale or redundant items
+- summarizes older history when useful
+- evicts lower-priority content
+- hands a smaller message list back to the agent loop
 
-The repo indexer prefers signatures and outlines to full file bodies, which is
-especially important for large repositories and small-context models.
+The agent loop gives it up to a few attempts before failing the run.
 
-### Lazy tool and skill loading
+## Tool-call compatibility rules
 
-When enabled, only compact tool descriptors are initially advertised. Full tool
-schemas are injected only when the conversation actually needs them.
+For OpenAI-compatible providers, tool-call history has to remain structurally valid:
 
-### Stable prompt assembly
+- assistant message with `tool_calls`
+- followed by matching `tool` message(s) with the same `tool_call_id`
 
-`promptasm` orders sections from stable to volatile so providers that support
-caching, or local runtimes benefiting from warm prefixes, can reuse more work.
+This matters especially for DeepSeek and other strict OpenAI-compatible backends.
+The current adapter sanitizes malformed historical tool-call blocks before sending
+them so compacted history does not poison later requests.
 
-## Editing architecture
+## Coder mode execution model
 
-Code edits pass through two layers:
+Coder mode introduces a persisted workflow layer.
 
-### Tool layer
+Sequence:
 
-The `edit` and `write_file` tools validate paths, normalize arguments, and
-return compact results. They also surface hash mismatches with current hash
-details so the model can recover instead of failing blindly.
+1. User enters a long-running coding request
+2. Orchestrator enriches the request
+3. Planner emits strict JSON tasks/phases
+4. Workflow is written to `.apex/sessions/<session-id>/workflows/`
+5. User reviews in the TUI plan pane
+6. `/approve` starts task execution
+7. Each task is executed through the shared agent loop with a role-specific prompt
+8. Results are appended to workflow history and shown in the plan pane
 
-### Diff engine
-
-The diff engine applies anchored hunks, supports fuzzy fallback, and can run
-verification commands after edits. If verification fails, it rolls changes back
-and returns a filtered failure summary instead of flooding the model with raw
-output.
-
-This keeps editing safe, surgical, and relatively cheap in prompt terms.
-
-## Retrieval and repository awareness
-
-The repo indexer exists to answer questions like:
-
-- which files matter for this feature?
-- what symbols exist here?
-- what does the high-level repo map look like?
-
-Its output feeds the `retrieved-context` pool rather than bypassing the prompt
-budget. That is a key architectural choice: retrieval is useful, but never
-allowed to become unbounded context.
+So coder mode is not a second independent backend. It is a workflow layer above
+the same provider/tool/agent infrastructure used by chat mode.
 
 ## Persistence model
 
-`apex-code` uses SQLite for local state so the binary stays self-contained.
+Local state is intentionally simple and local-first.
 
-State includes:
+Persistent data includes:
 
-- session records and turn summaries
-- working-set snapshots for resume
-- telemetry and token metrics
-- index and cache data
+- session records in `session.json`
+- curated working-set snapshots in the same session artifact
+- workflow JSON files under each session's `workflows/` directory
+- append-only `telemetry.json` files with timestamped LLM and tool events
 
-The system is intentionally local-first. It does not depend on a remote service
-for normal operation.
+This keeps the application portable and inspectable.
 
-## UI architecture
+## Telemetry model
 
-The TUI and one-shot flows share the same underlying agent runtime.
+Telemetry records:
 
-The TUI adds:
+- prompt / completion / total tokens
+- cache creation / cache read tokens when available
+- per-turn latency
+- model rollups
+- session rollups
+- savings attributed to lazy tools or compaction
+- workflow/task/agent context for coder-mode turns
+- tool-call names and tool-result counts
 
-- transcript rendering and navigation
-- streaming visuals
-- local interaction commands
-- inspection panes for tools, diffs, context, and stats
-- model/session affordances
+The TUI status bar token counter is a session-level running total rather than a
+single-request snapshot.
 
-This keeps the product surface richer without duplicating core execution logic.
+## Current practical tradeoffs
 
-## Extensibility
+- Provider caps for some OpenAI-compatible backends are still conservative defaults.
+- Context compaction is intentionally deterministic, not model-driven by default.
+- Tool-heavy repo-analysis tasks can still hit max iterations if the model keeps
+  exploring instead of converging.
+- The system prioritizes inspectability and deterministic tool usage over maximal autonomy.
 
-The architecture has multiple extension points:
+## Related docs
 
-- new providers via the provider interface
-- new native Go tools via the tool interface/registry
-- MCP tools via the MCP wrapper layer
-- skills via lazy-discovered bundles
-
-The shared registry, dispatcher, and gating model allow extensions to fit into
-the same safety and token-budget rules as built-in tools.
-
-## Testing strategy
-
-The repository emphasizes package-level and integration-style tests:
-
-- provider conformance tests
-- agent loop tests
-- context manager tests
-- tool behavior and output-capping tests
-- diff engine tests
-- TUI rendering and keyboard-flow tests
-- telemetry/session persistence tests
-
-The `fake` provider is particularly important because it allows deterministic
-testing of agent behavior without depending on live model backends.
-
-## Current tradeoffs and future work
-
-Some architecture decisions remain intentionally pragmatic:
-
-- lexical/local retrieval is favored over mandatory embeddings
-- small-model friendliness is prioritized over maximal agent complexity
-- the TUI already exposes diffs and runtime detail, but richer approval UX can
-  still be expanded
-
-The existing structure leaves room for more providers, richer skills, stricter
-approval flows, and deeper retrieval strategies without changing the overall
-shape of the system.
+- [`README.md`](../README.md)
+- [`docs/EXTENSIBILITY.md`](./EXTENSIBILITY.md)
+- [`docs/PATCH_FORMAT.md`](./PATCH_FORMAT.md)

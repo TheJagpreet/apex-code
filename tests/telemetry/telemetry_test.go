@@ -2,8 +2,11 @@ package telemetry_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apex-code/apex/internal/telemetry"
 )
@@ -119,5 +122,62 @@ func TestTelemetryDimensions(t *testing.T) {
 	}
 	if tr := telemetry.FormatTrace(recent); !strings.Contains(tr, "session=s2") || !strings.Contains(tr, "latency=100ms") {
 		t.Fatalf("trace format = %q", tr)
+	}
+}
+
+func TestSessionFileStoreAppendsStructuredTelemetry(t *testing.T) {
+	store, err := telemetry.OpenFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open file store: %v", err)
+	}
+	ctx := context.Background()
+	err = store.AppendEvent(ctx, "sess-1", telemetry.FileMeta{Model: "deepseek-v4-flash", CWD: "E:/repo"}, telemetry.SessionEvent{
+		Index:            1,
+		Timestamp:        time.Unix(1000, 0).UTC(),
+		Mode:             "chat",
+		Kind:             "llm_turn",
+		Model:            "deepseek-v4-flash",
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		TotalTokens:      15,
+		ToolCalls:        []string{"read_file"},
+		ToolResults:      1,
+	})
+	if err != nil {
+		t.Fatalf("append event 1: %v", err)
+	}
+	err = store.AppendEvent(ctx, "sess-1", telemetry.FileMeta{}, telemetry.SessionEvent{
+		Index:            2,
+		Timestamp:        time.Unix(1001, 0).UTC(),
+		Mode:             "coder",
+		Kind:             "task_llm_turn",
+		Model:            "deepseek-v4-flash",
+		PromptTokens:     20,
+		CompletionTokens: 10,
+		TotalTokens:      30,
+		WorkflowID:       "wf-1",
+		TaskID:           "T1",
+		Agent:            "solutioner",
+	})
+	if err != nil {
+		t.Fatalf("append event 2: %v", err)
+	}
+	totals, count, err := store.SessionTotals(ctx, "sess-1")
+	if err != nil {
+		t.Fatalf("session totals: %v", err)
+	}
+	if count != 2 || totals.TotalTokens != 45 {
+		t.Fatalf("totals=%+v count=%d", totals, count)
+	}
+	path := store.TelemetryPath("sess-1")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read telemetry file: %v", err)
+	}
+	if !strings.Contains(string(data), `"session_id": "sess-1"`) || !strings.Contains(string(data), `"workflow_id": "wf-1"`) {
+		t.Fatalf("telemetry file missing expected fields: %s", string(data))
+	}
+	if filepath.Base(filepath.Dir(path)) != "sess-1" {
+		t.Fatalf("telemetry path should live in session dir, got %s", path)
 	}
 }

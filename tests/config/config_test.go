@@ -12,13 +12,14 @@ func TestResolvePrecedence(t *testing.T) {
 	dir := t.TempDir()
 	projectToml := filepath.Join(dir, "apex.toml")
 	if err := os.WriteFile(projectToml, []byte(`
+provider = "ollama"
 model = "project-model"
-ollama_url = "http://project"
+base_url = "http://project"
 max_iterations = 4
 lazy_tools = true
 skills = ["skills/project"]
 data_dir = ".apex-project"
-state_db = ".apex-project/state.db"
+state_path = ".apex-project/state.json"
 
 [budget]
 history = 0.25
@@ -30,9 +31,12 @@ history = 0.25
 	lazy := false
 	maxIterations := 9
 	settings, err := config.Resolve(dir, map[string]string{
+		"APEX_PROVIDER":       "openai",
+		"OPENAI_API_KEY":      "sk-test",
 		"APEX_OLLAMA_URL":     "http://env",
 		"APEX_MAX_ITERATIONS": "7",
 	}, config.Partial{
+		Provider:      stringPtr("ollama"),
 		Model:         &model,
 		LazyTools:     &lazy,
 		MaxIterations: &maxIterations,
@@ -41,6 +45,9 @@ history = 0.25
 		t.Fatalf("resolve: %v", err)
 	}
 
+	if settings.Provider != "ollama" {
+		t.Fatalf("provider = %q", settings.Provider)
+	}
 	if settings.Model != "flag-model" {
 		t.Fatalf("model = %q", settings.Model)
 	}
@@ -53,8 +60,8 @@ history = 0.25
 	if settings.LazyTools {
 		t.Fatal("flag override should disable lazy tools")
 	}
-	if want := filepath.Join(dir, ".apex-project", "state.db"); settings.StateDBPath != want {
-		t.Fatalf("state db = %q, want %q", settings.StateDBPath, want)
+	if want := filepath.Join(dir, ".apex-project", "state.json"); settings.StateDBPath != want {
+		t.Fatalf("state path = %q, want %q", settings.StateDBPath, want)
 	}
 	if len(settings.SkillRoots) != 1 || settings.SkillRoots[0] != filepath.Join(dir, "skills", "project") {
 		t.Fatalf("skill roots = %v", settings.SkillRoots)
@@ -62,4 +69,30 @@ history = 0.25
 	if settings.Budget.History != 0.25 {
 		t.Fatalf("budget history = %f", settings.Budget.History)
 	}
+	if !settings.BudgetSet {
+		t.Fatal("budget should be marked explicit when configured")
+	}
 }
+
+func TestResolveDefaultsToOpenAIWhenAPIKeyPresent(t *testing.T) {
+	settings, err := config.Resolve(t.TempDir(), map[string]string{
+		"OPENAI_API_KEY": "sk-test",
+	}, config.Partial{})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if settings.Provider != "openai" {
+		t.Fatalf("provider = %q", settings.Provider)
+	}
+	if settings.Model != "gpt-4o-mini" {
+		t.Fatalf("model = %q", settings.Model)
+	}
+	if settings.BaseURL != "https://api.openai.com/v1" {
+		t.Fatalf("base url = %q", settings.BaseURL)
+	}
+	if settings.BudgetSet {
+		t.Fatal("budget should not be marked explicit by default")
+	}
+}
+
+func stringPtr(v string) *string { return &v }

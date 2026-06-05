@@ -133,6 +133,9 @@ type WorkflowAgentRun struct {
 	PromptTokens    int                `json:"prompt_tokens,omitempty"`
 	CompletionTokens int               `json:"completion_tokens,omitempty"`
 	TotalTokens     int                `json:"total_tokens,omitempty"`
+	BudgetPromptTokens int             `json:"budget_prompt_tokens,omitempty"`
+	BudgetPromptLimit int              `json:"budget_prompt_limit,omitempty"`
+	BudgetOutputHeadroom int           `json:"budget_output_headroom,omitempty"`
 	DurationMs      int64              `json:"duration_ms,omitempty"`
 	StartedAt       time.Time          `json:"started_at"`
 	CompletedAt     time.Time          `json:"completed_at"`

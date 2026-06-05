@@ -13,7 +13,6 @@ import (
 
 	"github.com/apex-code/apex/internal/config"
 	"github.com/apex-code/apex/internal/mcp"
-	"github.com/apex-code/apex/internal/provider/ollama"
 	"github.com/apex-code/apex/internal/telemetry"
 	"github.com/apex-code/apex/internal/tui"
 )
@@ -57,13 +56,16 @@ func Main(args []string) int {
 
 	fs := flag.NewFlagSet("apex", flag.ContinueOnError)
 	var (
-		model      = fs.String("model", ollama.DefaultModel, "Ollama model tag")
-		baseURL    = fs.String("ollama-url", ollama.DefaultBaseURL, "Ollama server base URL")
+		provider   = fs.String("provider", "ollama", "model provider (ollama or openai)")
+		model      = fs.String("model", "", "provider model name")
+		baseURL    = fs.String("base-url", "", "provider base URL")
+		ollamaURL  = fs.String("ollama-url", "", "deprecated alias for -base-url when using Ollama")
 		maxIter    = fs.Int("max-iterations", 50, "maximum agent loop turns before stopping")
 		verbose    = fs.Bool("verbose", false, "show expanded technical details in the TUI")
 		lazyTools  = fs.Bool("lazy-tools", false, "advertise tool/skill names only; inject full schemas on demand (plan 8)")
 		skillsDir  = fs.String("skills", defaultSkillsDir(), "directory of skill bundles")
-		stateDB    = fs.String("state-db", "", "SQLite state database path")
+		dataDir    = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
+		stateDB    = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
 		resume     = fs.String("resume", "", "resume a prior session by id or 'latest'")
 		forceTUI   = fs.Bool("tui", false, "force the interactive TUI even with a prompt argument")
 		forceShell = fs.Bool("one-shot", false, "force one-shot mode (never launch the TUI)")
@@ -73,12 +75,18 @@ func Main(args []string) int {
 	}
 
 	cwd, _ := os.Getwd()
-	settings, err := config.Resolve(cwd, envMap(), config.Partial{
-		Model:         nonDefaultString(*model, ollama.DefaultModel),
-		BaseURL:       nonDefaultString(*baseURL, ollama.DefaultBaseURL),
+	resolvedBaseURL := strings.TrimSpace(*baseURL)
+	if resolvedBaseURL == "" {
+		resolvedBaseURL = strings.TrimSpace(*ollamaURL)
+	}
+	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
+		Provider:      nonDefaultString(*provider, "ollama"),
+		Model:         nonEmptyString(*model),
+		BaseURL:       nonEmptyString(resolvedBaseURL),
 		MaxIterations: nonDefaultInt(*maxIter, 50),
 		LazyTools:     nonDefaultBool(*lazyTools, false),
 		SkillRoots:    nonDefaultRoots(*skillsDir, defaultSkillsDir()),
+		DataDir:       nonEmptyString(*dataDir),
 		StateDBPath:   nonEmptyString(*stateDB),
 		Resume:        nonEmptyString(*resume),
 	})
@@ -88,13 +96,17 @@ func Main(args []string) int {
 	}
 
 	cfg := Config{
+		Provider:      settings.Provider,
 		Model:         settings.Model,
 		BaseURL:       settings.BaseURL,
+		APIKey:        settings.APIKey,
 		MaxIterations: settings.MaxIterations,
 		LazyTools:     settings.LazyTools,
 		SkillRoots:    settings.SkillRoots,
 		Budget:        settings.Budget,
+		BudgetSet:     settings.BudgetSet,
 		CWD:           cwd,
+		DataDir:       settings.DataDir,
 		StateDBPath:   settings.StateDBPath,
 		Resume:        settings.Resume,
 		Features:      settings.Features,
@@ -236,7 +248,8 @@ func splitRoots(s string) []string {
 func runStats(args []string) int {
 	fs := flag.NewFlagSet("apex stats", flag.ContinueOnError)
 	var (
-		stateDB   = fs.String("state-db", "", "SQLite state database path")
+		dataDir   = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
+		stateDB   = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
 		session   = fs.String("session", "", "optional session id to scope the stats")
 		byModel   = fs.Bool("by-model", false, "break usage down per model")
 		bySession = fs.Bool("by-session", false, "break usage down per session id")
@@ -246,7 +259,10 @@ func runStats(args []string) int {
 		return 2
 	}
 	cwd, _ := os.Getwd()
-	settings, err := config.Resolve(cwd, envMap(), config.Partial{StateDBPath: nonEmptyString(*stateDB)})
+	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
+		DataDir:     nonEmptyString(*dataDir),
+		StateDBPath: nonEmptyString(*stateDB),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
@@ -301,14 +317,18 @@ func runStats(args []string) int {
 func runSessions(args []string) int {
 	fs := flag.NewFlagSet("apex sessions", flag.ContinueOnError)
 	var (
-		stateDB = fs.String("state-db", "", "SQLite state database path")
+		dataDir = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
+		stateDB = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
 		limit   = fs.Int("limit", 10, "maximum sessions to list")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	cwd, _ := os.Getwd()
-	settings, err := config.Resolve(cwd, envMap(), config.Partial{StateDBPath: nonEmptyString(*stateDB)})
+	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
+		DataDir:     nonEmptyString(*dataDir),
+		StateDBPath: nonEmptyString(*stateDB),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
@@ -342,7 +362,7 @@ func runMCP(args []string) int {
 		return 2
 	}
 	cwd, _ := os.Getwd()
-	settings, err := config.Resolve(cwd, envMap(), config.Partial{})
+	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
@@ -395,10 +415,15 @@ func defaultSkillsDir() string {
 
 var errNoPrompt = errors.New("no prompt provided")
 
-func envMap() map[string]string {
+func envMap(cwd string) map[string]string {
 	out := map[string]string{}
 	for _, item := range os.Environ() {
 		if key, value, ok := strings.Cut(item, "="); ok {
+			out[key] = value
+		}
+	}
+	for key, value := range loadDotEnv(filepath.Join(cwd, ".env")) {
+		if _, exists := out[key]; !exists {
 			out[key] = value
 		}
 	}

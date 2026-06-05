@@ -65,6 +65,7 @@ type BudgetSnapshot struct {
 	PromptTokens   int
 	PromptLimit    int
 	OutputHeadroom int
+	SessionTokens  int
 	Pools          []PoolSnapshot
 }
 
@@ -231,6 +232,9 @@ func renderBudgetMeter(b BudgetSnapshot, width int, verbose bool) string {
 }
 
 func renderBudgetCompact(b BudgetSnapshot) string {
+	if b.SessionTokens > 0 {
+		return fmt.Sprintf("tok %d", b.SessionTokens)
+	}
 	return fmt.Sprintf("tok %d", b.PromptTokens)
 }
 

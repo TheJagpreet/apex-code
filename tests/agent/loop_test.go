@@ -212,6 +212,58 @@ func TestRunBudgetUsesCompactorAndLogs(t *testing.T) {
 	}
 }
 
+func TestRunWithoutExplicitBudgetUsesLargePromptWindow(t *testing.T) {
+	p := fake.New([]provider.StreamEvent{
+		{Kind: provider.EventText, Text: "ok"},
+		{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+	}).WithCapabilities(provider.Caps{
+		ContextWindow:     8192,
+		MaxOutputTokens:   4096,
+		SupportsStreaming: true,
+	})
+
+	state, err := agent.New(p, nil).Run(context.Background(), []domain.Message{
+		{Role: domain.RoleUser, Content: "hi"},
+	}, agent.Options{MaxIterations: 1})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if state.LastBudget.PromptLimit != 7168 {
+		t.Fatalf("prompt limit = %d", state.LastBudget.PromptLimit)
+	}
+	if state.LastBudget.OutputHeadroom != 1024 {
+		t.Fatalf("headroom = %d", state.LastBudget.OutputHeadroom)
+	}
+}
+
+func TestRunWithExplicitBudgetStillUsesProviderMaxOutputHeadroom(t *testing.T) {
+	p := fake.New([]provider.StreamEvent{
+		{Kind: provider.EventText, Text: "ok"},
+		{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+	}).WithCapabilities(provider.Caps{
+		ContextWindow:     8192,
+		MaxOutputTokens:   4096,
+		SupportsStreaming: true,
+	})
+
+	state, err := agent.New(p, nil).Run(context.Background(), []domain.Message{
+		{Role: domain.RoleUser, Content: "hi"},
+	}, agent.Options{
+		MaxIterations:   1,
+		BudgetSet:       true,
+		BudgetFractions: agent.DefaultBudgetFractions(),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if state.LastBudget.PromptLimit != 4096 {
+		t.Fatalf("prompt limit = %d", state.LastBudget.PromptLimit)
+	}
+	if state.LastBudget.OutputHeadroom != 4096 {
+		t.Fatalf("headroom = %d", state.LastBudget.OutputHeadroom)
+	}
+}
+
 func TestRunBudgetWithoutCompactorFails(t *testing.T) {
 	p := fake.New(nil).WithCapabilities(provider.Caps{
 		ContextWindow:     32,

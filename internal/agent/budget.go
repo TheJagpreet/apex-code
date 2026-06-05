@@ -74,6 +74,10 @@ func buildBudget(caps provider.Caps, opts Options) Budget {
 		window = 8192
 	}
 
+	if !opts.BudgetSet {
+		return buildUnboundedBudget(window, caps, opts)
+	}
+
 	fractions := opts.BudgetFractions
 	if fractions == (BudgetFractions{}) {
 		fractions = DefaultBudgetFractions()
@@ -116,6 +120,40 @@ func buildBudget(caps provider.Caps, opts Options) Budget {
 		OutputHeadroom: headroom,
 		Pools:          pools,
 		Fractions:      fractions,
+	}
+}
+
+func buildUnboundedBudget(window int, caps provider.Caps, opts Options) Budget {
+	headroom := opts.MaxTokens
+	if headroom <= 0 {
+		headroom = 1024
+	}
+	if caps.MaxOutputTokens > 0 && caps.MaxOutputTokens < headroom {
+		headroom = caps.MaxOutputTokens
+	}
+	if headroom >= window {
+		headroom = window / 8
+		if headroom <= 0 {
+			headroom = 1
+		}
+	}
+	promptLimit := window - headroom
+	if promptLimit < 1 {
+		promptLimit = 1
+	}
+	return Budget{
+		TotalWindow:    window,
+		PromptLimit:    promptLimit,
+		OutputHeadroom: headroom,
+		Pools: map[PoolName]int{
+			PoolSystem:         0,
+			PoolTools:          0,
+			PoolHistory:        0,
+			PoolRetrieved:      0,
+			PoolWorkingFiles:   0,
+			PoolOutputHeadroom: headroom,
+		},
+		Fractions: opts.BudgetFractions,
 	}
 }
 

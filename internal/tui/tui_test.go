@@ -161,6 +161,9 @@ func TestRenderBudgetMeter(t *testing.T) {
 	if got := renderBudgetCompact(BudgetSnapshot{PromptTokens: 1234, PromptLimit: 4096}); got != "tok 1234" {
 		t.Fatalf("compact budget wrong: %q", got)
 	}
+	if got := renderBudgetCompact(BudgetSnapshot{PromptTokens: 1234, SessionTokens: 7777}); got != "tok 7777" {
+		t.Fatalf("compact session budget wrong: %q", got)
+	}
 }
 
 func TestRenderToolInspector(t *testing.T) {

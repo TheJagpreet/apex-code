@@ -43,8 +43,15 @@ func TestWorkflowStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read workflow dir: %v", err)
 	}
-	if len(entries) != 1 || !strings.Contains(entries[0].Name(), "-session-1-") {
-		t.Fatalf("workflow filename should include session id, got %v", entries)
+	if len(entries) != 1 || entries[0].Name() != "session-1" || !entries[0].IsDir() {
+		t.Fatalf("workflow root should contain session directory, got %v", entries)
+	}
+	workflowEntries, err := os.ReadDir(filepath.Join(store.Root(), "session-1", "workflows"))
+	if err != nil {
+		t.Fatalf("read workflow session dir: %v", err)
+	}
+	if len(workflowEntries) != 1 || !strings.Contains(workflowEntries[0].Name(), "-session-1-") {
+		t.Fatalf("workflow filename should include session id, got %v", workflowEntries)
 	}
 }
 
@@ -109,6 +116,190 @@ func TestEngineCreateApproveExecuteWorkflow(t *testing.T) {
 	}
 	if strings.TrimSpace(wf.ExecutionSummary) == "" {
 		t.Fatalf("expected execution summary to be populated: %+v", wf)
+	}
+}
+
+func TestEngineExecuteWorkflowWithToolCall(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Inspect README","planner_instructions":"Use repository tools"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"Plan ready","phases":[{"name":"inspection","description":"inspect repo","task_ids":["t1"]}],"tasks":[{"id":"t1","phase":"inspection","title":"Read README","description":"Read the README and summarize the project name","dependencies":[],"status":"pending","owner_agent":"solutioner","acceptance_criteria":["Project name identified"],"outputs":[]}]}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventToolCall, ToolCall: &domain.ToolCall{ID: "call_1", Name: "read_file", Arguments: []byte(`{"path":"README.md"}`)}},
+			{Kind: provider.EventDone, StopReason: domain.StopToolUse},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"status":"done","summary":"The project name is apex-code."}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"workflow completed"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 4}
+	})
+	wf, err := engine.CreatePlan(context.Background(), "session-tools", "Inspect the README")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	wf, err = engine.ApprovePlan(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("approve plan: %v", err)
+	}
+	wf, err = engine.Execute(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if wf.State != domain.WorkflowStateCompleted {
+		t.Fatalf("workflow state = %s, want completed", wf.State)
+	}
+	if wf.Tasks[0].Status != domain.WorkflowTaskDone {
+		t.Fatalf("task status = %s, want done", wf.Tasks[0].Status)
+	}
+}
+
+func TestEngineExecuteWorkflowFinalizesAfterMaxIterations(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Inspect architecture","planner_instructions":"Use repository tools"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"Plan ready","phases":[{"name":"inspection","description":"inspect repo","task_ids":["t1"]}],"tasks":[{"id":"t1","phase":"inspection","title":"Analyze architecture","description":"Inspect the codebase and summarize the architecture","dependencies":[],"status":"pending","owner_agent":"architecture","acceptance_criteria":["Architecture summarized"],"outputs":[]}]}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventToolCall, ToolCall: &domain.ToolCall{ID: "call_1", Name: "read_file", Arguments: []byte(`{"path":"README.md"}`)}},
+			{Kind: provider.EventDone, StopReason: domain.StopToolUse},
+		},
+		{
+			{Kind: provider.EventToolCall, ToolCall: &domain.ToolCall{ID: "call_2", Name: "read_file", Arguments: []byte(`{"path":"internal/codermode/engine.go","start_line":1,"end_line":120}`)}},
+			{Kind: provider.EventDone, StopReason: domain.StopToolUse},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"status":"done","summary":"The architecture flows from CLI entrypoint to provider/tool wiring, then through coder orchestration and task execution."}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 2}
+	})
+	wf, err := engine.CreatePlan(context.Background(), "session-finalize", "Inspect the architecture")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	wf, err = engine.ApprovePlan(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("approve plan: %v", err)
+	}
+	wf, err = engine.Execute(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if wf.State != domain.WorkflowStateCompleted {
+		t.Fatalf("workflow state = %s, want completed", wf.State)
+	}
+	if wf.Tasks[0].Status != domain.WorkflowTaskDone {
+		t.Fatalf("task status = %s, want done", wf.Tasks[0].Status)
+	}
+	if got := strings.Join(wf.Tasks[0].Outputs, " "); !strings.Contains(got, "architecture flows") {
+		t.Fatalf("task outputs = %+v", wf.Tasks[0].Outputs)
+	}
+}
+
+func TestEngineExecuteWorkflowAcceptsPlainTextFinalResponse(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Inspect README","planner_instructions":"Use repository tools"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"Plan ready","phases":[{"name":"inspection","description":"inspect repo","task_ids":["t1"]}],"tasks":[{"id":"t1","phase":"inspection","title":"Read README","description":"Read the README and summarize it","dependencies":[],"status":"pending","owner_agent":"solutioner","acceptance_criteria":["README summarized"],"outputs":[]}]}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `Read the README and summarized the project structure.`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 2}
+	})
+	wf, err := engine.CreatePlan(context.Background(), "session-nonjson", "Inspect the README")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	wf, err = engine.ApprovePlan(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("approve plan: %v", err)
+	}
+	wf, err = engine.Execute(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if wf.Tasks[0].Status != domain.WorkflowTaskDone {
+		t.Fatalf("task status = %s, want done", wf.Tasks[0].Status)
+	}
+	if got := strings.Join(wf.Tasks[0].Outputs, " "); !strings.Contains(got, "summarized the project structure") {
+		t.Fatalf("task outputs = %+v", wf.Tasks[0].Outputs)
+	}
+}
+
+func TestEngineExecuteWorkflowBlockedPrefixControlsTaskState(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Create file","planner_instructions":"Use tools"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"Plan ready","phases":[{"name":"build","description":"do it","task_ids":["t1"]}],"tasks":[{"id":"t1","phase":"build","title":"Create file","description":"Create a file in the workspace","dependencies":[],"status":"pending","owner_agent":"solutioner","acceptance_criteria":["File created"],"outputs":[]}]}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `BLOCKED: write_file was not called, so no file was created.`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 2}
+	})
+	wf, err := engine.CreatePlan(context.Background(), "session-blocked", "Create file")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	wf, err = engine.ApprovePlan(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("approve plan: %v", err)
+	}
+	wf, err = engine.Execute(context.Background(), wf)
+	if err != nil {
+		t.Fatalf("execute plan: %v", err)
+	}
+	if wf.Tasks[0].Status != domain.WorkflowTaskBlocked {
+		t.Fatalf("task status = %s, want blocked", wf.Tasks[0].Status)
 	}
 }
 

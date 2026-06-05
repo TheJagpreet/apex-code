@@ -43,6 +43,9 @@ func (s *Store) Save(_ context.Context, wf domain.CoderWorkflow) error {
 		return fmt.Errorf("marshal workflow: %w", err)
 	}
 	path := s.pathForWorkflow(wf)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
@@ -67,27 +70,33 @@ func (s *Store) Load(_ context.Context, id string) (domain.CoderWorkflow, error)
 }
 
 func (s *Store) List(_ context.Context) ([]domain.CoderWorkflow, error) {
-	entries, err := os.ReadDir(s.root)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]domain.CoderWorkflow, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
+	var out []domain.CoderWorkflow
+	err := filepath.WalkDir(s.root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		data, err := os.ReadFile(filepath.Join(s.root, entry.Name()))
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(path)) != "workflows" {
+			return nil
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var wf domain.CoderWorkflow
 		if err := json.Unmarshal(data, &wf); err != nil {
-			return nil, err
+			return err
 		}
 		if err := ValidateWorkflow(wf); err != nil {
-			return nil, err
+			return err
 		}
 		out = append(out, wf)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
@@ -114,7 +123,7 @@ func (s *Store) pathForWorkflow(wf domain.CoderWorkflow) string {
 	if sessionPart == "" {
 		sessionPart = "ad-hoc"
 	}
-	return filepath.Join(s.root, timestampPart+"-"+sessionPart+"-"+sanitizeFilePart(wf.ID)+".json")
+	return filepath.Join(s.root, sessionPart, "workflows", timestampPart+"-"+sessionPart+"-"+sanitizeFilePart(wf.ID)+".json")
 }
 
 func (s *Store) findPath(id string) (string, error) {
@@ -126,20 +135,28 @@ func (s *Store) findPath(id string) (string, error) {
 	if _, err := os.Stat(direct); err == nil {
 		return direct, nil
 	}
-	entries, err := os.ReadDir(s.root)
-	if err != nil {
-		return "", err
-	}
+	var found string
 	suffix := "-" + sanitizeFilePart(id) + ".json"
-	for _, entry := range entries {
+	err := filepath.WalkDir(s.root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
 		if entry.IsDir() {
-			continue
+			return nil
 		}
 		if strings.HasSuffix(entry.Name(), suffix) {
-			return filepath.Join(s.root, entry.Name()), nil
+			found = path
+			return filepath.SkipAll
 		}
+		return nil
+	})
+	if err != nil && err != filepath.SkipAll {
+		return "", err
 	}
-	return "", os.ErrNotExist
+	if found == "" {
+		return "", os.ErrNotExist
+	}
+	return found, nil
 }
 
 func ValidateWorkflow(wf domain.CoderWorkflow) error {

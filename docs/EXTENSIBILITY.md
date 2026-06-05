@@ -12,11 +12,16 @@
 
 1. CLI flags
 2. Environment variables
-3. Project `apex.toml`
-4. User config at `%AppData%/apex-code/apex.toml` on Windows or `~/.config/apex-code/apex.toml` elsewhere
-5. Built-in defaults
+3. Project `.env`
+4. Project `apex.toml`
+5. User config at `%AppData%/apex-code/apex.toml` on Windows or `~/.config/apex-code/apex.toml` elsewhere
+6. Built-in defaults
 
 See [`docs/apex.toml.example`](./apex.toml.example) for a complete sample.
+
+The primary persistence knob is `data_dir`. By default apex stores sessions,
+telemetry, workflows, and indexes under `.apex/`. `state_path` remains
+available as a compatibility alias for older configs.
 
 ## MCP
 

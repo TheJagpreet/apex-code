@@ -12,7 +12,6 @@ import (
 	"github.com/apex-code/apex/internal/codermode"
 	"github.com/apex-code/apex/internal/contextmgr"
 	"github.com/apex-code/apex/internal/domain"
-	"github.com/apex-code/apex/internal/provider/ollama"
 	"github.com/apex-code/apex/internal/session"
 	"github.com/apex-code/apex/internal/telemetry"
 	"github.com/apex-code/apex/internal/tui"
@@ -134,7 +133,7 @@ func (a *tuiAgent) run(ctx context.Context, prompt string, onDelta func(string))
 	reply := tui.Reply{
 		Turns:       len(state.Turns),
 		Termination: string(state.TerminationReason),
-		Budget:      budgetSnapshot(state.LastBudget),
+		Budget:      a.withSessionTokens(budgetSnapshot(state.LastBudget)),
 		ToolCalls:   toolCallViews(state.Turns),
 		Diffs:       diffViews(state.Turns),
 		Mode:        a.mode,
@@ -177,15 +176,25 @@ func (a *tuiAgent) NewSession() error {
 }
 
 func (a *tuiAgent) SetModel(ctx context.Context, model string) error {
-	client := ollama.New(ollama.WithModel(model), ollama.WithBaseURL(a.deps.cfg.BaseURL))
-	if err := client.EnsureModel(ctx); err != nil {
+	nextCfg := a.deps.cfg
+	nextCfg.Model = model
+	client, err := newProvider(nextCfg)
+	if err != nil {
 		return err
 	}
+	if c, ok := client.(interface{ EnsureModel(context.Context) error }); ok {
+		if err := c.EnsureModel(ctx); err != nil {
+			return err
+		}
+	}
 	a.deps.Provider = client
-	a.deps.cfg.Model = model
+	a.deps.cfg = nextCfg
 	a.deps.Context = contextmgr.New(client, contextmgr.Options{
 		Logger: contextmgr.MultiInstrumenter{a.deps.Collector},
 	})
+	if a.deps.Coder != nil {
+		a.deps.Coder = codermode.NewEngine(client, a.deps.Dispatcher, a.deps.Workflows, a.deps.Options)
+	}
 	return nil
 }
 
@@ -237,7 +246,7 @@ func (a *tuiAgent) CoderSubmit(ctx context.Context, prompt string) (tui.Reply, e
 	}
 	return tui.Reply{
 		Text:     text,
-		Budget:   a.coderBudget(ctx, wf),
+		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Stats:    wfSummary(wf),
 		Mode:     a.mode,
 		Workflow: a.CoderWorkflow(),
@@ -255,7 +264,7 @@ func (a *tuiAgent) CoderReview(ctx context.Context, feedback string) (tui.Reply,
 	a.workflow = &wf
 	return tui.Reply{
 		Text:     renderWorkflowChatSummary(wf, "Planner revised the workflow. Updated plan below. Use `/approve` to approve and start execution, or `/replan <feedback>` to revise it again."),
-		Budget:   a.coderBudget(ctx, wf),
+		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Stats:    wfSummary(wf),
 		Mode:     a.mode,
 		Workflow: a.CoderWorkflow(),
@@ -273,7 +282,7 @@ func (a *tuiAgent) CoderApprove(ctx context.Context) (tui.Reply, error) {
 	a.workflow = &wf
 	return tui.Reply{
 		Text:     renderWorkflowChatSummary(wf, "Plan approved. The workflow is ready for execution."),
-		Budget:   a.coderBudget(ctx, wf),
+		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Stats:    wfSummary(wf),
 		Mode:     a.mode,
 		Workflow: a.CoderWorkflow(),
@@ -289,7 +298,7 @@ func (a *tuiAgent) CoderExecute(ctx context.Context) (tui.Reply, error) {
 	if err != nil {
 		return tui.Reply{
 			Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution stopped with an error: "+err.Error()),
-			Budget:   a.coderBudget(ctx, wf),
+			Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 			Stats:    wfSummary(wf),
 			Mode:     a.mode,
 			Workflow: a.CoderWorkflow(),
@@ -297,7 +306,7 @@ func (a *tuiAgent) CoderExecute(ctx context.Context) (tui.Reply, error) {
 	}
 	reply := tui.Reply{
 		Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution updated: "+string(wf.State)),
-		Budget:   a.coderBudget(ctx, wf),
+		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Mode:     a.mode,
 		Workflow: a.CoderWorkflow(),
 	}
@@ -314,9 +323,13 @@ func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Rep
 		if onUpdate == nil {
 			return
 		}
+		budget := a.coderBudget(ctx, event.Workflow)
+		if event.Budget.PromptLimit > 0 || event.Budget.TotalPromptTokens > 0 {
+			budget = budgetSnapshot(event.Budget)
+		}
 		onUpdate(tui.Reply{
 			Text:     renderWorkflowProgressEvent(event),
-			Budget:   a.coderBudget(ctx, event.Workflow),
+			Budget:   a.withSessionTokens(budget),
 			Stats:    wfSummary(event.Workflow),
 			Mode:     a.mode,
 			Workflow: a.CoderWorkflow(),
@@ -326,7 +339,7 @@ func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Rep
 	if err != nil {
 		return tui.Reply{
 			Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution stopped with an error: "+err.Error()),
-			Budget:   a.coderBudget(ctx, wf),
+			Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 			Stats:    wfSummary(wf),
 			Mode:     a.mode,
 			Workflow: a.CoderWorkflow(),
@@ -334,7 +347,7 @@ func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Rep
 	}
 	return tui.Reply{
 		Text:     renderWorkflowExecutionSummary(wf, "Coder workflow execution completed."),
-		Budget:   a.coderBudget(ctx, wf),
+		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Stats:    wfSummary(wf),
 		Mode:     a.mode,
 		Workflow: a.CoderWorkflow(),
@@ -395,9 +408,9 @@ func renderWorkflowExecutionSummary(wf domain.CoderWorkflow, intro string) strin
 	b.WriteString(agentRunChain(wf))
 	b.WriteString("\n\n")
 	b.WriteString("## Totals\n\n")
-	b.WriteString(fmt.Sprintf("  input_tokens: %d\n", workflowPromptTokenTotal(wf)))
-	b.WriteString(fmt.Sprintf("  output_tokens: %d\n", workflowCompletionTokenTotal(wf)))
-	b.WriteString(fmt.Sprintf("  total_tokens: %d\n", workflowTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  cumulative_request_input_tokens: %d\n", workflowPromptTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  cumulative_request_output_tokens: %d\n", workflowCompletionTokenTotal(wf)))
+	b.WriteString(fmt.Sprintf("  cumulative_request_total_tokens: %d\n", workflowTokenTotal(wf)))
 	b.WriteString(fmt.Sprintf("  time_taken: %s\n", workflowDuration(wf)))
 	return strings.TrimSpace(b.String())
 }
@@ -537,12 +550,22 @@ func budgetSnapshot(r agent.BudgetReport) tui.BudgetSnapshot {
 	}
 }
 
+func (a *tuiAgent) withSessionTokens(b tui.BudgetSnapshot) tui.BudgetSnapshot {
+	if a.deps != nil {
+		b.SessionTokens = a.deps.SessionTotalTokens
+	}
+	return b
+}
+
 func (a *tuiAgent) coderBudget(ctx context.Context, wf domain.CoderWorkflow) tui.BudgetSnapshot {
 	if a.deps == nil || a.deps.Provider == nil {
 		return tui.BudgetSnapshot{}
 	}
 	caps := a.deps.Provider.Capabilities()
-	totalTokens := workflowTokenTotal(wf)
+	if latest, ok := latestWorkflowBudget(wf); ok {
+		return latest
+	}
+	totalTokens := 0
 	if totalTokens == 0 {
 		content := workflowBudgetText(wf)
 		counted, err := a.deps.Provider.CountTokens(ctx, []domain.Message{{
@@ -558,6 +581,21 @@ func (a *tuiAgent) coderBudget(ctx context.Context, wf domain.CoderWorkflow) tui
 		PromptLimit:    caps.ContextWindow,
 		OutputHeadroom: caps.MaxOutputTokens,
 	}
+}
+
+func latestWorkflowBudget(wf domain.CoderWorkflow) (tui.BudgetSnapshot, bool) {
+	for i := len(wf.RunHistory) - 1; i >= 0; i-- {
+		run := wf.RunHistory[i]
+		if run.BudgetPromptLimit <= 0 && run.BudgetPromptTokens <= 0 {
+			continue
+		}
+		return tui.BudgetSnapshot{
+			PromptTokens:   run.BudgetPromptTokens,
+			PromptLimit:    run.BudgetPromptLimit,
+			OutputHeadroom: run.BudgetOutputHeadroom,
+		}, true
+	}
+	return tui.BudgetSnapshot{}, false
 }
 
 func workflowBudgetText(wf domain.CoderWorkflow) string {

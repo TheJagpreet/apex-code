@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/apex-code/apex/internal/agent"
 	"github.com/apex-code/apex/internal/codermode"
@@ -17,23 +18,27 @@ import (
 	"github.com/apex-code/apex/internal/domain"
 	"github.com/apex-code/apex/internal/mcp"
 	"github.com/apex-code/apex/internal/provider"
-	"github.com/apex-code/apex/internal/provider/ollama"
 	"github.com/apex-code/apex/internal/session"
 	"github.com/apex-code/apex/internal/skills"
 	"github.com/apex-code/apex/internal/telemetry"
 	"github.com/apex-code/apex/internal/tools"
+	"github.com/google/uuid"
 )
 
 // Config captures the resolved flags/inputs for a single apex invocation.
 type Config struct {
+	Provider      string
 	Model         string
 	BaseURL       string
+	APIKey        string
 	MaxIterations int
 	LazyTools     bool
 	SkillRoots    []string
 	Budget        agent.BudgetFractions
+	BudgetSet     bool
 	Prompt        string
 	CWD           string
+	DataDir       string
 	StateDBPath   string
 	WorkflowRoot  string
 	Resume        string
@@ -53,10 +58,13 @@ type Deps struct {
 	Skills     *skills.Loader
 	Sessions   *session.Store
 	Telemetry  *telemetry.Store
+	TelemetryFiles *telemetry.FileStore
 	Collector  *telemetry.Collector
 	Workflows  *codermode.Store
 	Coder      *codermode.Engine
 	SessionID  string
+	SessionTurnSeq int
+	SessionTotalTokens int
 	Initial    []domain.Message
 	cfg        Config
 }
@@ -64,7 +72,10 @@ type Deps struct {
 // BuildDeps assembles the provider, tool registry, context manager, and the
 // lazy tool/skill machinery for the given config.
 func BuildDeps(cfg Config) (*Deps, error) {
-	client := ollama.New(ollama.WithModel(cfg.Model), ollama.WithBaseURL(cfg.BaseURL))
+	client, err := newProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
 	registry := tools.NewDefaultRegistry()
 	router := tools.NewRouter(registry)
 
@@ -105,9 +116,15 @@ func BuildDeps(cfg Config) (*Deps, error) {
 		}
 		deps.Telemetry = store
 	}
+	sessionRoot := filepath.Join(filepathDir(cfg.StateDBPath), "sessions")
+	files, err := telemetry.OpenFileStore(sessionRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open session file store: %w", err)
+	}
+	deps.TelemetryFiles = files
 	workflowRoot := cfg.WorkflowRoot
 	if strings.TrimSpace(workflowRoot) == "" {
-		workflowRoot = filepath.Join(filepathDir(cfg.StateDBPath), "workflows")
+		workflowRoot = sessionRoot
 	}
 	wfStore, err := codermode.OpenStore(workflowRoot)
 	if err != nil {
@@ -115,6 +132,7 @@ func BuildDeps(cfg Config) (*Deps, error) {
 	}
 	deps.Workflows = wfStore
 	deps.Coder = codermode.NewEngine(client, deps.Dispatcher, wfStore, deps.Options)
+	deps.Coder.SetTelemetrySink(deps.appendSessionEvent)
 	if cfg.Features.MCP {
 		for _, server := range cfg.MCPServers {
 			if !server.Enabled || strings.TrimSpace(server.Command) == "" {
@@ -158,10 +176,10 @@ func (d *Deps) Close() error {
 	return first
 }
 
-// EnsureModel verifies the configured model is available, surfacing the
-// actionable "ollama pull" error if not.
+// EnsureModel verifies the configured model is available when the active
+// provider supports proactive validation.
 func (d *Deps) EnsureModel(ctx context.Context) error {
-	if c, ok := d.Provider.(*ollama.Client); ok {
+	if c, ok := d.Provider.(interface{ EnsureModel(context.Context) error }); ok {
 		return c.EnsureModel(ctx)
 	}
 	return nil
@@ -194,6 +212,7 @@ func (d *Deps) Options() agent.Options {
 		Model:           d.cfg.Model,
 		MaxIterations:   d.cfg.MaxIterations,
 		BudgetFractions: d.cfg.Budget,
+		BudgetSet:       d.cfg.BudgetSet,
 		Compactor:       d.Context.Compactor(),
 		KeepAlive:       "10m",
 	}
@@ -301,12 +320,14 @@ func (d *Deps) LoadResume(ctx context.Context, selector string) error {
 		return err
 	}
 	d.SessionID = record.ID
+	d.loadSessionTelemetryState(ctx)
 	rehydrated := d.Context.Rehydrate(snap.WorkingSet)
 	d.Initial = d.Context.Messages(rehydrated)
 	return nil
 }
 
 func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, state agent.LoopState) error {
+	sessionID := d.ensureSessionID()
 	savedBy := d.Collector.LastSavedBy()
 	if d.cfg.LazyTools {
 		lazy := tools.MeasureSchemaTokens(nil, d.Registry, d.Lazy.Active()).Saved()
@@ -325,7 +346,7 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 			WorkingSet: d.Context.FromMessages(state.Messages),
 		}
 		record, _, err := d.Sessions.Save(ctx, session.SaveInput{
-			SessionID:   d.SessionID,
+			SessionID:   sessionID,
 			Model:       d.cfg.Model,
 			CWD:         d.cfg.CWD,
 			Prompt:      lastUserText(inputMessages),
@@ -338,33 +359,98 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 		}
 		d.SessionID = record.ID
 	}
-	if d.Telemetry != nil {
-		for i, turn := range state.Turns {
-			if err := d.Telemetry.SaveTurn(ctx, telemetry.TurnMetric{
-				SessionID:        d.effectiveSessionID(),
-				TurnIndex:        i + 1,
-				Model:            d.cfg.Model,
-				PromptTokens:     turn.Response.Usage.PromptTokens,
-				CompletionTokens: turn.Response.Usage.CompletionTokens,
-				TotalTokens:      turn.Response.Usage.TotalTokens,
-				CacheCreation:    turn.Response.Usage.CacheCreationTokens,
-				CacheRead:        turn.Response.Usage.CacheReadTokens,
-				DurationMs:       turn.Duration.Milliseconds(),
-				Termination:      string(state.TerminationReason),
-				SavedBy:          savedBy,
-			}); err != nil {
-				return err
-			}
+	for _, turn := range state.Turns {
+		if err := d.appendSessionEvent(ctx, telemetry.SessionEvent{
+			Mode:             "chat",
+			Kind:             "llm_turn",
+			Model:            d.cfg.Model,
+			PromptTokens:     turn.Response.Usage.PromptTokens,
+			CompletionTokens: turn.Response.Usage.CompletionTokens,
+			TotalTokens:      turn.Response.Usage.TotalTokens,
+			CacheCreation:    turn.Response.Usage.CacheCreationTokens,
+			CacheRead:        turn.Response.Usage.CacheReadTokens,
+			DurationMs:       turn.Duration.Milliseconds(),
+			Termination:      string(turn.Response.StopReason),
+			ToolCalls:        toolCallNames(turn.ToolCalls),
+			ToolResults:      len(turn.ToolResults),
+			SavedBy:          savedBy,
+			Error:            errorString(turn.Err),
+			Summary:          summarizeTurn(turn),
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func (d *Deps) effectiveSessionID() string {
-	if d.SessionID != "" {
-		return d.SessionID
+	return d.ensureSessionID()
+}
+
+func (d *Deps) ensureSessionID() string {
+	if strings.TrimSpace(d.SessionID) == "" {
+		d.SessionID = uuid.NewString()
+		d.SessionTurnSeq = 0
+		d.SessionTotalTokens = 0
 	}
-	return "ad-hoc"
+	return d.SessionID
+}
+
+func (d *Deps) loadSessionTelemetryState(ctx context.Context) {
+	d.SessionTurnSeq = 0
+	d.SessionTotalTokens = 0
+	if d.TelemetryFiles == nil || strings.TrimSpace(d.SessionID) == "" {
+		return
+	}
+	totals, count, err := d.TelemetryFiles.SessionTotals(ctx, d.SessionID)
+	if err != nil {
+		return
+	}
+	d.SessionTurnSeq = count
+	d.SessionTotalTokens = totals.TotalTokens
+}
+
+func (d *Deps) appendSessionEvent(ctx context.Context, event telemetry.SessionEvent) error {
+	sessionID := d.ensureSessionID()
+	d.SessionTurnSeq++
+	event.Index = d.SessionTurnSeq
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+	if strings.TrimSpace(event.Model) == "" {
+		event.Model = d.cfg.Model
+	}
+	if strings.TrimSpace(event.Mode) == "" {
+		event.Mode = "chat"
+	}
+	if d.TelemetryFiles != nil {
+		if err := d.TelemetryFiles.AppendEvent(ctx, sessionID, telemetry.FileMeta{
+			Model: d.cfg.Model,
+			CWD:   d.cfg.CWD,
+		}, event); err != nil {
+			return err
+		}
+	}
+	if d.Telemetry != nil {
+		if err := d.Telemetry.SaveTurn(ctx, telemetry.TurnMetric{
+			SessionID:        sessionID,
+			TurnIndex:        event.Index,
+			Model:            event.Model,
+			PromptTokens:     event.PromptTokens,
+			CompletionTokens: event.CompletionTokens,
+			TotalTokens:      event.TotalTokens,
+			CacheCreation:    event.CacheCreation,
+			CacheRead:        event.CacheRead,
+			DurationMs:       event.DurationMs,
+			Termination:      event.Termination,
+			SavedBy:          cloneSavedBy(event.SavedBy),
+			CreatedAt:        event.Timestamp.Unix(),
+		}); err != nil {
+			return err
+		}
+	}
+	d.SessionTotalTokens += event.TotalTokens
+	return nil
 }
 
 func turnRecords(state agent.LoopState, savedBy map[string]int) []session.TurnRecord {
@@ -399,6 +485,33 @@ func cloneSavedBy(in map[string]int) map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+func toolCallNames(calls []domain.ToolCall) []string {
+	out := make([]string, 0, len(calls))
+	for _, call := range calls {
+		if strings.TrimSpace(call.Name) != "" {
+			out = append(out, strings.TrimSpace(call.Name))
+		}
+	}
+	return out
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func summarizeTurn(turn agent.Turn) string {
+	if strings.TrimSpace(turn.Response.Message.Content) != "" {
+		return strings.TrimSpace(turn.Response.Message.Content)
+	}
+	if len(turn.ToolCalls) > 0 {
+		return "tool_use"
+	}
+	return ""
 }
 
 func filepathDir(path string) string {

@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <em>Talks to local models via Ollama. Keeps your context window lean. Lives in a polished TUI.</em>
+  <em>Works with Ollama or OpenAI-compatible chat models. Keeps your context window lean. Lives in a polished TUI.</em>
 </p>
 
 ---
@@ -29,7 +29,7 @@ Most coding agents assume a frontier cloud model and a fat context window. apex-
 takes the opposite bet: small local models, a tight token budget, and a workflow that
 treats context as the scarcest resource.
 
-- **Local-first.** Runs against Ollama models on your machine. No API keys, no egress.
+- **Flexible backends.** Defaults to Ollama, or switches to OpenAI when you provide an API key.
 - **Token-efficient.** A budget-aware context manager keeps prompts small and predictable.
 - **Workflow-aware.** Coder mode can turn larger jobs into a persisted, reviewable plan.
 - **Polished TUI.** A real terminal workspace, not a logline firehose.
@@ -69,7 +69,10 @@ with the Go toolchain.
 
 - **Go 1.22+**
 - **[Ollama](https://ollama.com)** running locally with at least one model pulled
-  (e.g. `ollama pull gemma3:2b`)
+  (e.g. `ollama pull gemma4:e2b`) for the default local flow
+
+If you want to use OpenAI instead, you only need an API key and a `.env` file
+or exported environment variables. Ollama is not required for that path.
 
 **Windows (PowerShell)**
 
@@ -86,6 +89,13 @@ go build -o apex ./cmd/apex
 ## Quick start
 
 ```bash
+# OpenAI via .env or exported env vars
+cat > .env <<'EOF'
+APEX_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+APEX_MODEL=gpt-4o-mini
+EOF
+
 # interactive TUI
 ./apex
 
@@ -102,6 +112,12 @@ git diff | ./apex "review these changes"
 apex picks its mode automatically: a bare invocation opens the TUI, a prompt argument
 runs one-shot, and piped stdin is folded into the prompt. Force either direction with
 `-tui` or `-one-shot`.
+
+Provider selection is automatic:
+
+- If `.env` or your shell exports `APEX_PROVIDER=openai` (or an `OPENAI_API_KEY`),
+  apex uses OpenAI.
+- Otherwise apex defaults to Ollama.
 
 ## Features
 
@@ -145,8 +161,8 @@ Coder mode adds a workflow-oriented execution path for longer coding jobs:
 - Workflow state, task status, active agent, and recent agent runs are persisted
   and restored on session resume.
 
-Workflow files are stored as JSON next to the local state database, so the plan
-and execution trace remain inspectable outside the TUI too.
+Workflow files are stored under the active session directory, so the plan and
+execution trace remain inspectable outside the TUI too.
 
 ### Streaming output with the weave animation
 
@@ -201,8 +217,16 @@ relative paths.
 
 A budget-aware context manager assembles each prompt from sized pools — system, tools,
 history, retrieved, working files — plus an output headroom reserve. When a turn would
-overflow the prompt limit, a compactor shrinks history until it fits. Every pool limit
-is tunable via `APEX_BUDGET_*` env vars (see [Configuration](#configuration)).
+overflow the prompt limit, a compactor shrinks history until it fits.
+
+Budget behavior has two modes:
+
+- If you do **not** set any `APEX_BUDGET_*` values, apex uses a relaxed default:
+  it tries to use most of the model's context window and reserves only a modest
+  output headroom.
+- If you **do** set one or more `APEX_BUDGET_*` values, apex switches to explicit
+  pool budgeting and enforces the configured split across system, tools, history,
+  retrieved context, working files, and output headroom.
 
 ### Tools
 
@@ -242,17 +266,22 @@ expose their tools to the agent, and use the `apex mcp` subcommand to manage the
 
 ### Sessions
 
-Conversations are persisted to a local SQLite store with their working set. Resume the
-latest or a specific session with `-resume latest` / `-resume <id>`, or from inside the
-TUI with `/resume`. List recent sessions with `apex sessions` or `/sessions`, and start
-a clean window with `/new`.
+Each session gets its own folder under `.apex/sessions/<session-id>/`:
+
+- `session.json` for the resumable working set and session metadata
+- `telemetry.json` for timestamped LLM/tool telemetry across chat and coder mode
+- `workflows/` for any coder-mode workflow JSON created in that session
+
+Resume the latest or a specific session with `-resume latest` / `-resume <id>`,
+or from inside the TUI with `/resume`. List recent sessions with `apex sessions`
+or `/sessions`, and start a clean window with `/new`.
 
 Coder-mode workflows are persisted separately as JSON and automatically reattached
 when a resumed session has recent workflow state.
 
 ### Telemetry & tracing
 
-Every turn is recorded to the local state DB across multiple dimensions:
+Every relevant LLM turn is recorded to the session telemetry file across multiple dimensions:
 
 - **Consumption** — prompt / completion / total tokens, cache-creation & cache-read.
 - **Cache efficiency** — cache-hit ratio.
@@ -262,7 +291,10 @@ Every turn is recorded to the local state DB across multiple dimensions:
 - **Session map** — usage rolled up per session id.
 - **Savings** — what the context manager and lazy tools saved you.
 
-Inspect it all with `apex stats`:
+The TUI status bar `tok` value shows the net session token total, updated as each
+LLM call finishes in either chat or coder mode.
+
+Inspect session telemetry from the CLI with `apex stats`:
 
 ```bash
 apex stats                       # totals (tokens, cache-hit, avg latency, models, last seen)
@@ -274,28 +306,87 @@ apex stats -session <id>         # scope any of the above to one session
 
 ## Configuration
 
-apex-code reads configuration from flags and environment variables (flags win).
+apex-code reads configuration from flags, `.env`, `apex.toml`, and environment
+variables (explicit flags win). A project-local `.env` is loaded automatically
+when present, and existing shell env vars still take precedence over `.env`.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `-model` | `APEX_MODEL` | `gemma3:2b` | Ollama model tag |
-| `-ollama-url` | `APEX_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `-provider` | `APEX_PROVIDER` | `ollama` | Provider backend (`ollama` or `openai`) |
+| `-model` | `APEX_MODEL` | provider-specific | Model name (`gemma4:e2b`, `gpt-4o-mini`, etc.) |
+| `-base-url` | `APEX_BASE_URL` | provider-specific | Provider base URL |
+| `-ollama-url` | `APEX_OLLAMA_URL` | `http://localhost:11434` | Backward-compatible alias for Ollama base URL |
 | `-max-iterations` | `APEX_MAX_ITERATIONS` | `50` | Max agent loop turns |
 | `-lazy-tools` | `APEX_LAZY_TOOLS` | `false` | Advertise tool names; load schemas on demand |
 | `-skills` | `APEX_SKILLS_DIR` | `./skills` | Skill bundles directory |
-| `-state-db` | `APEX_STATE_DB` | (data dir) | SQLite state database path |
+| `-data-dir` | `APEX_DATA_DIR` | `./.apex` | Base directory for sessions, workflows, telemetry, and indexes |
+| `-state-db` | `APEX_STATE_DB` | compatibility alias | Deprecated compatibility alias for the old state path |
 | `-resume` | `APEX_RESUME` | — | Resume a prior session (`id` or `latest`) |
 | `-verbose` | — | `false` | Expanded technical detail in the TUI |
 | `-tui` / `-one-shot` | — | (auto) | Force interactive / non-interactive mode |
 | — | `APEX_DATA_DIR` | OS data dir | Base directory for state |
+| — | `OPENAI_API_KEY` / `APEX_API_KEY` | — | API key for the OpenAI provider |
 
-**Budget pools** — tune how the prompt is divided:
+Common OpenAI setup:
+
+```dotenv
+APEX_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+APEX_MODEL=gpt-4o-mini
+```
+
+Common Ollama setup:
+
+```dotenv
+APEX_PROVIDER=ollama
+APEX_MODEL=gemma4:e2b
+APEX_BASE_URL=http://localhost:11434
+```
+
+**Budgeting**
+
+Default behavior:
+
+- If no `APEX_BUDGET_*` variables are set, apex uses almost the full provider
+  window automatically and keeps a small output reserve.
+- This is the recommended default for most users.
+
+Explicit budgeting:
+
+- Set one or more `APEX_BUDGET_*` values to enable strict pool-based budgeting.
+- Fractions are decimal shares of the total context window, for example `0.10`
+  for 10%.
+
+Budget variables:
 
 `APEX_BUDGET_SYSTEM` · `APEX_BUDGET_TOOLS` · `APEX_BUDGET_HISTORY` ·
 `APEX_BUDGET_RETRIEVED` · `APEX_BUDGET_WORKING_FILES` · `APEX_BUDGET_OUTPUT_HEADROOM`
 
-By default, coder-mode workflow files live in a sibling `workflows/` directory
-next to the configured state DB.
+Example explicit budget config:
+
+```dotenv
+APEX_BUDGET_SYSTEM=0.10
+APEX_BUDGET_TOOLS=0.10
+APEX_BUDGET_HISTORY=0.40
+APEX_BUDGET_RETRIEVED=0.15
+APEX_BUDGET_WORKING_FILES=0.15
+APEX_BUDGET_OUTPUT_HEADROOM=0.10
+```
+
+Use explicit budget fractions if you want tighter, more predictable prompt shaping.
+Leave them unset if you prefer the agent to use most of the available context window.
+
+The default on-disk layout is:
+
+```text
+.apex/
+  sessions/
+    <session-id>/
+      session.json
+      telemetry.json
+      workflows/
+        <timestamp>-<session-id>-<workflow-id>.json
+```
 
 ## CLI reference
 
@@ -319,7 +410,7 @@ internal/contextmgr budget-aware context assembly
 internal/tools      built-in + MCP + dynamic/lazy tool registry
 internal/skills     skill bundle discovery
 internal/session    session persistence
-internal/telemetry  SQLite metrics store and rollups
+internal/telemetry  file-backed session telemetry and rollups
 ```
 
 For a fuller walkthrough of the runtime layers, request flow, token-efficiency

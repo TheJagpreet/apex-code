@@ -67,7 +67,7 @@ func TestStablePrefixBytesIgnoreVolatileChanges(t *testing.T) {
 	}
 }
 
-func TestSQLiteCacheIsContentAddressed(t *testing.T) {
+func TestCacheIsContentAddressed(t *testing.T) {
 	cache, err := promptasm.OpenMemoryCache()
 	if err != nil {
 		t.Fatalf("OpenMemoryCache: %v", err)

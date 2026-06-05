@@ -2,15 +2,15 @@ package telemetry
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/apex-code/apex/internal/contextmgr"
-	_ "modernc.org/sqlite"
+	"github.com/google/uuid"
 )
 
 type TurnMetric struct {
@@ -42,7 +42,6 @@ type Totals struct {
 	SavedBy          map[string]int
 }
 
-// AvgLatencyMs returns the mean per-turn latency, or 0 when unknown.
 func (t Totals) AvgLatencyMs() int64 {
 	if t.Turns == 0 || t.DurationMs == 0 {
 		return 0
@@ -51,148 +50,177 @@ func (t Totals) AvgLatencyMs() int64 {
 }
 
 type Store struct {
-	db *sql.DB
+	files *FileStore
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	root, err := telemetrySessionRoot(path)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
-	if err := s.Init(context.Background()); err != nil {
-		db.Close()
+	files, err := OpenFileStore(root)
+	if err != nil {
 		return nil, err
 	}
-	return s, nil
+	return &Store{files: files}, nil
 }
 
 func OpenMemory() (*Store, error) {
-	return Open(":memory:")
+	return Open(filepath.Join(os.TempDir(), "apex-telemetry-memory-"+uuid.NewString()))
 }
 
-func (s *Store) Close() error {
-	if s == nil || s.db == nil {
-		return nil
-	}
-	return s.db.Close()
-}
+func (s *Store) Close() error { return nil }
 
-func (s *Store) Init(ctx context.Context) error {
-	pragmas := []string{
-		`pragma busy_timeout = 5000`,
-		`pragma journal_mode = wal`,
-		`pragma synchronous = normal`,
-	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
-			return err
-		}
-	}
-	_, err := s.db.ExecContext(ctx, `create table if not exists turn_metrics (
-		session_id text not null,
-		turn_index integer not null,
-		model text not null,
-		prompt_tokens integer not null,
-		completion_tokens integer not null,
-		total_tokens integer not null,
-		cache_creation_tokens integer not null,
-		cache_read_tokens integer not null,
-		termination text not null,
-		saved_by_json text not null,
-		created_at integer not null,
-		primary key(session_id, turn_index)
-	)`)
-	if err != nil {
-		return err
-	}
-	// Best-effort migration for databases created before the latency dimension
-	// existed. A duplicate-column error is expected and ignored on upgraded DBs.
-	if _, err := s.db.ExecContext(ctx, `alter table turn_metrics add column duration_ms integer not null default 0`); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return err
-	}
-	// Index the dimensions we trace by so model/session/time rollups stay cheap.
-	for _, idx := range []string{
-		`create index if not exists idx_turn_metrics_model on turn_metrics(model)`,
-		`create index if not exists idx_turn_metrics_created on turn_metrics(created_at)`,
-	} {
-		if _, err := s.db.ExecContext(ctx, idx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+func (s *Store) Init(_ context.Context) error { return nil }
 
 func (s *Store) SaveTurn(ctx context.Context, metric TurnMetric) error {
 	if metric.CreatedAt == 0 {
 		metric.CreatedAt = time.Now().Unix()
 	}
-	savedByJSON, err := json.Marshal(metric.SavedBy)
-	if err != nil {
-		return fmt.Errorf("marshal telemetry savings: %w", err)
+	if s == nil || s.files == nil {
+		return fmt.Errorf("telemetry store is not initialized")
 	}
-	_, err = s.db.ExecContext(ctx, `insert into turn_metrics(
-		session_id, turn_index, model, prompt_tokens, completion_tokens, total_tokens,
-		cache_creation_tokens, cache_read_tokens, duration_ms, termination, saved_by_json, created_at
-	) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	on conflict(session_id, turn_index) do update set
-		model=excluded.model,
-		prompt_tokens=excluded.prompt_tokens,
-		completion_tokens=excluded.completion_tokens,
-		total_tokens=excluded.total_tokens,
-		cache_creation_tokens=excluded.cache_creation_tokens,
-		cache_read_tokens=excluded.cache_read_tokens,
-		duration_ms=excluded.duration_ms,
-		termination=excluded.termination,
-		saved_by_json=excluded.saved_by_json,
-		created_at=excluded.created_at`,
-		metric.SessionID, metric.TurnIndex, metric.Model, metric.PromptTokens, metric.CompletionTokens, metric.TotalTokens,
-		metric.CacheCreation, metric.CacheRead, metric.DurationMs, metric.Termination, string(savedByJSON), metric.CreatedAt)
-	return err
+	return s.files.AppendEvent(ctx, metric.SessionID, FileMeta{Model: metric.Model}, SessionEvent{
+		Index:            metric.TurnIndex,
+		Timestamp:        time.Unix(metric.CreatedAt, 0).UTC(),
+		Mode:             "chat",
+		Kind:             "llm_turn",
+		Model:            metric.Model,
+		PromptTokens:     metric.PromptTokens,
+		CompletionTokens: metric.CompletionTokens,
+		TotalTokens:      metric.TotalTokens,
+		CacheCreation:    metric.CacheCreation,
+		CacheRead:        metric.CacheRead,
+		DurationMs:       metric.DurationMs,
+		Termination:      metric.Termination,
+		SavedBy:          cloneSavedBy(metric.SavedBy),
+	})
 }
 
-const metricColumns = `session_id, turn_index, model, prompt_tokens, completion_tokens, total_tokens,
-	cache_creation_tokens, cache_read_tokens, duration_ms, termination, saved_by_json, created_at`
-
-func scanMetric(rows *sql.Rows) (TurnMetric, error) {
-	var m TurnMetric
-	var savedByJSON string
-	if err := rows.Scan(&m.SessionID, &m.TurnIndex, &m.Model, &m.PromptTokens, &m.CompletionTokens,
-		&m.TotalTokens, &m.CacheCreation, &m.CacheRead, &m.DurationMs, &m.Termination, &savedByJSON, &m.CreatedAt); err != nil {
-		return TurnMetric{}, err
+func (s *Store) queryMetrics(_ context.Context, sessionID string) ([]TurnMetric, error) {
+	if s == nil || s.files == nil {
+		return nil, nil
 	}
-	m.SavedBy = map[string]int{}
-	_ = json.Unmarshal([]byte(savedByJSON), &m.SavedBy)
-	return m, nil
-}
-
-// queryMetrics returns rows for the whole store (empty sessionID) or one session.
-func (s *Store) queryMetrics(ctx context.Context, sessionID string) ([]TurnMetric, error) {
-	var rows *sql.Rows
-	var err error
-	if strings.TrimSpace(sessionID) == "" {
-		rows, err = s.db.QueryContext(ctx, `select `+metricColumns+` from turn_metrics order by created_at, turn_index`)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `select `+metricColumns+` from turn_metrics where session_id = ? order by turn_index`, sessionID)
-	}
+	artifacts, err := s.readArtifacts(sessionID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []TurnMetric
-	for rows.Next() {
-		m, err := scanMetric(rows)
-		if err != nil {
-			return nil, err
+	out := make([]TurnMetric, 0)
+	for _, doc := range artifacts {
+		for _, event := range doc.Events {
+			out = append(out, TurnMetric{
+				SessionID:        doc.SessionID,
+				TurnIndex:        event.Index,
+				Model:            event.Model,
+				PromptTokens:     event.PromptTokens,
+				CompletionTokens: event.CompletionTokens,
+				TotalTokens:      event.TotalTokens,
+				CacheCreation:    event.CacheCreation,
+				CacheRead:        event.CacheRead,
+				DurationMs:       event.DurationMs,
+				Termination:      event.Termination,
+				SavedBy:          cloneSavedBy(event.SavedBy),
+				CreatedAt:        event.Timestamp.Unix(),
+			})
 		}
-		out = append(out, m)
 	}
-	return out, rows.Err()
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAt == out[j].CreatedAt {
+			return out[i].TurnIndex < out[j].TurnIndex
+		}
+		return out[i].CreatedAt < out[j].CreatedAt
+	})
+	return out, nil
 }
 
-// accumulate folds one metric into a running Totals, tracking the token, latency,
-// time-window, and model dimensions.
+func (s *Store) readArtifacts(sessionID string) ([]SessionArtifact, error) {
+	if strings.TrimSpace(sessionID) != "" {
+		doc, err := s.files.readLocked(s.files.TelemetryPath(sessionID), sessionID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return []SessionArtifact{doc}, nil
+	}
+	entries, err := os.ReadDir(s.files.Root())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]SessionArtifact, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		doc, err := s.files.readLocked(filepath.Join(s.files.Root(), entry.Name(), "telemetry.json"), entry.Name())
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, doc)
+	}
+	return out, nil
+}
+
+func (s *Store) Totals(ctx context.Context, sessionID string) (Totals, error) {
+	metrics, err := s.queryMetrics(ctx, sessionID)
+	if err != nil {
+		return Totals{}, err
+	}
+	total := Totals{SavedBy: map[string]int{}}
+	for _, m := range metrics {
+		total.accumulate(m)
+	}
+	sort.Strings(total.Models)
+	return total, nil
+}
+
+func (s *Store) ByModel(ctx context.Context, sessionID string) (map[string]Totals, error) {
+	metrics, err := s.queryMetrics(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]Totals{}
+	for _, m := range metrics {
+		t := out[m.Model]
+		t.accumulate(m)
+		out[m.Model] = t
+	}
+	return out, nil
+}
+
+func (s *Store) BySession(ctx context.Context) (map[string]Totals, error) {
+	metrics, err := s.queryMetrics(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]Totals{}
+	for _, m := range metrics {
+		t := out[m.SessionID]
+		t.accumulate(m)
+		out[m.SessionID] = t
+	}
+	return out, nil
+}
+
+func (s *Store) Recent(ctx context.Context, sessionID string, limit int) ([]TurnMetric, error) {
+	metrics, err := s.queryMetrics(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(metrics, func(i, j int) bool { return metrics[i].CreatedAt > metrics[j].CreatedAt })
+	if limit > 0 && len(metrics) > limit {
+		metrics = metrics[:limit]
+	}
+	return metrics, nil
+}
+
 func (t *Totals) accumulate(m TurnMetric) {
 	if t.SavedBy == nil {
 		t.SavedBy = map[string]int{}
@@ -210,72 +238,12 @@ func (t *Totals) accumulate(m TurnMetric) {
 	if m.CreatedAt > t.LastAt {
 		t.LastAt = m.CreatedAt
 	}
-	if m.Model != "" {
-		if !containsString(t.Models, m.Model) {
-			t.Models = append(t.Models, m.Model)
-		}
+	if m.Model != "" && !containsString(t.Models, m.Model) {
+		t.Models = append(t.Models, m.Model)
 	}
 	for name, value := range m.SavedBy {
 		t.SavedBy[name] += value
 	}
-}
-
-func (s *Store) Totals(ctx context.Context, sessionID string) (Totals, error) {
-	metrics, err := s.queryMetrics(ctx, sessionID)
-	if err != nil {
-		return Totals{}, err
-	}
-	total := Totals{SavedBy: map[string]int{}}
-	for _, m := range metrics {
-		total.accumulate(m)
-	}
-	sort.Strings(total.Models)
-	return total, nil
-}
-
-// ByModel rolls usage up per model — the model-based trace dimension. Pass an
-// empty sessionID to roll up across every session.
-func (s *Store) ByModel(ctx context.Context, sessionID string) (map[string]Totals, error) {
-	metrics, err := s.queryMetrics(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]Totals{}
-	for _, m := range metrics {
-		t := out[m.Model]
-		t.accumulate(m)
-		out[m.Model] = t
-	}
-	return out, nil
-}
-
-// BySession rolls usage up per session id — the session-id map dimension.
-func (s *Store) BySession(ctx context.Context) (map[string]Totals, error) {
-	metrics, err := s.queryMetrics(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]Totals{}
-	for _, m := range metrics {
-		t := out[m.SessionID]
-		t.accumulate(m)
-		out[m.SessionID] = t
-	}
-	return out, nil
-}
-
-// Recent returns the most recent turn-level traces (newest first), bounded by
-// limit. Pass an empty sessionID to span every session.
-func (s *Store) Recent(ctx context.Context, sessionID string, limit int) ([]TurnMetric, error) {
-	metrics, err := s.queryMetrics(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	sort.SliceStable(metrics, func(i, j int) bool { return metrics[i].CreatedAt > metrics[j].CreatedAt })
-	if limit > 0 && len(metrics) > limit {
-		metrics = metrics[:limit]
-	}
-	return metrics, nil
 }
 
 func containsString(xs []string, want string) bool {
@@ -288,22 +256,15 @@ func containsString(xs []string, want string) bool {
 }
 
 type Collector struct {
-	last contextmgr.RenderReport
+	last map[string]int
 }
 
 func (c *Collector) Render(report contextmgr.RenderReport) {
-	c.last = report
+	c.last = cloneSavedBy(report.SavedBy)
 }
 
 func (c *Collector) LastSavedBy() map[string]int {
-	if len(c.last.SavedBy) == 0 {
-		return map[string]int{}
-	}
-	out := make(map[string]int, len(c.last.SavedBy))
-	for k, v := range c.last.SavedBy {
-		out[k] = v
-	}
-	return out
+	return cloneSavedBy(c.last)
 }
 
 func FormatTotals(t Totals) string {
@@ -332,8 +293,6 @@ func FormatTotals(t Totals) string {
 	return strings.Join(parts, "  ")
 }
 
-// FormatByModel renders a per-model usage breakdown, one line per model, sorted
-// by name for stable output.
 func FormatByModel(byModel map[string]Totals) string {
 	if len(byModel) == 0 {
 		return "(no model traces yet)"
@@ -359,8 +318,6 @@ func FormatByModel(byModel map[string]Totals) string {
 	return strings.Join(lines, "\n")
 }
 
-// FormatTrace renders recent turn-level traces as timestamped lines across the
-// session, model, consumption, and latency dimensions.
 func FormatTrace(metrics []TurnMetric) string {
 	if len(metrics) == 0 {
 		return "(no traces yet)"
@@ -405,4 +362,30 @@ func formatSavedBy(savedBy map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s=%d", name, savedBy[name]))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func cloneSavedBy(in map[string]int) map[string]int {
+	if len(in) == 0 {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func telemetrySessionRoot(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return filepath.Join(".", "sessions"), nil
+	}
+	clean := filepath.Clean(path)
+	if strings.EqualFold(filepath.Base(clean), "sessions") {
+		return clean, nil
+	}
+	if filepath.Ext(clean) != "" {
+		return filepath.Join(filepath.Dir(clean), "sessions"), nil
+	}
+	return filepath.Join(clean, "sessions"), nil
 }

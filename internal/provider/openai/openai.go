@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/apex-code/apex/internal/domain"
@@ -91,14 +93,18 @@ func (c *Client) Complete(ctx context.Context, req domain.Request) (provider.Str
 	if model == "" {
 		model = c.model
 	}
+	sanitizedMessages := sanitizeToolConversation(req.Messages)
 	wire := chatRequest{
 		Model:       model,
-		Messages:    toMessages(req.Messages),
+		Messages:    toMessages(sanitizedMessages),
 		Tools:       toTools(req.Tools),
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stop:        req.Stop,
 		Stream:      true,
+	}
+	if c.isDeepSeek() {
+		wire.Thinking = &thinkingConfig{Type: "disabled"}
 	}
 	body, err := json.Marshal(wire)
 	if err != nil {
@@ -120,19 +126,27 @@ func (c *Client) Complete(ctx context.Context, req domain.Request) (provider.Str
 	if resp.StatusCode != http.StatusOK {
 		msg := readErrorBody(resp.Body)
 		resp.Body.Close()
+		if c.isDeepSeek() && strings.Contains(strings.ToLower(msg), "tool_call") {
+			msg += " | request_shape: " + summarizeMessages(wire.Messages)
+		}
 		return nil, fmt.Errorf("openai-compatible: /chat/completions returned %s: %s", resp.Status, msg)
 	}
 	return newStream(resp.Body), nil
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []message `json:"messages"`
-	Tools       []tool    `json:"tools,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stop        []string  `json:"stop,omitempty"`
-	Stream      bool      `json:"stream"`
+	Model       string          `json:"model"`
+	Messages    []message       `json:"messages"`
+	Tools       []tool          `json:"tools,omitempty"`
+	Temperature float64         `json:"temperature,omitempty"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
+	Stop        []string        `json:"stop,omitempty"`
+	Thinking    *thinkingConfig `json:"thinking,omitempty"`
+	Stream      bool            `json:"stream"`
+}
+
+type thinkingConfig struct {
+	Type string `json:"type"`
 }
 
 type message struct {
@@ -288,6 +302,7 @@ func (s *stream) Recv() (provider.StreamEvent, error) {
 			if choice.FinishReason == "tool_calls" {
 				for i := 0; i < len(s.toolCalls); i++ {
 					if call := s.toolCalls[i]; call != nil {
+						ensureToolCallID(call, i)
 						copied := *call
 						s.pending = append(s.pending, provider.StreamEvent{
 							Kind:     provider.EventToolCall,
@@ -343,6 +358,93 @@ func readErrorBody(r io.Reader) string {
 		return e.Error.Message
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+func (c *Client) isDeepSeek() bool {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return strings.Contains(strings.ToLower(c.baseURL), "deepseek.com")
+	}
+	return strings.Contains(strings.ToLower(u.Host), "deepseek.com")
+}
+
+func ensureToolCallID(call *domain.ToolCall, index int) {
+	if call == nil || strings.TrimSpace(call.ID) != "" {
+		return
+	}
+	call.ID = "call_" + strconv.Itoa(index+1)
+}
+
+func sanitizeToolConversation(messages []domain.Message) []domain.Message {
+	out := make([]domain.Message, 0, len(messages))
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+		if msg.Role == domain.RoleTool {
+			continue
+		}
+		if msg.Role != domain.RoleAssistant || len(msg.ToolCalls) == 0 {
+			out = append(out, msg)
+			continue
+		}
+
+		j := i + 1
+		seen := map[string]bool{}
+		for ; j < len(messages) && messages[j].Role == domain.RoleTool; j++ {
+			for _, tr := range messages[j].ToolResults {
+				if strings.TrimSpace(tr.ToolCallID) != "" {
+					seen[strings.TrimSpace(tr.ToolCallID)] = true
+				}
+			}
+		}
+
+		valid := true
+		for idx := range msg.ToolCalls {
+			call := msg.ToolCalls[idx]
+			ensureToolCallID(&call, idx)
+			if !seen[call.ID] {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			i = j - 1
+			continue
+		}
+		out = append(out, msg)
+		for k := i + 1; k < j; k++ {
+			out = append(out, messages[k])
+		}
+		i = j - 1
+	}
+	return out
+}
+
+func summarizeMessages(messages []message) string {
+	parts := make([]string, 0, len(messages))
+	for i, msg := range messages {
+		part := fmt.Sprintf("%d:%s", i, msg.Role)
+		if len(msg.ToolCalls) > 0 {
+			ids := make([]string, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				ids = append(ids, firstNonEmpty(tc.ID, tc.Function.Name))
+			}
+			part += "[tool_calls=" + strings.Join(ids, ",") + "]"
+		}
+		if msg.ToolCallID != "" {
+			part += "[tool_call_id=" + msg.ToolCallID + "]"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 var _ provider.Provider = (*Client)(nil)

@@ -69,8 +69,10 @@ type Options struct {
 	PromptCache     bool
 	MaxIterations   int
 	BudgetFractions BudgetFractions
+	BudgetSet       bool
 	Logger          *slog.Logger
 	Compactor       Compactor
+	OnTurn          func(Turn, BudgetReport, int, int)
 
 	// StreamText, when set, is invoked with each assistant text delta as it is
 	// received from the provider, enabling live streaming UIs. It does not change
@@ -195,6 +197,9 @@ func (l *Loop) Run(ctx context.Context, messages []domain.Message, opts Options)
 		state.Iteration++
 		turn.Budget = budgetReport
 		state.Turns = append(state.Turns, turn)
+		if opts.OnTurn != nil {
+			opts.OnTurn(turn, budgetReport, state.Iteration, state.MaxIterations)
+		}
 		if err != nil {
 			state.Phase = PhaseDone
 			state.TerminationReason = TerminationError
@@ -308,6 +313,9 @@ func latestUserIndex(messages []domain.Message) int {
 func freshToolStart(messages []domain.Message) int {
 	i := len(messages)
 	for i > 0 && messages[i-1].Role == domain.RoleTool {
+		i--
+	}
+	if i > 0 && i < len(messages) && messages[i-1].Role == domain.RoleAssistant && len(messages[i-1].ToolCalls) > 0 {
 		i--
 	}
 	return i
