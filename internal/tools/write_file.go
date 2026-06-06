@@ -25,7 +25,7 @@ func NewWriteFileTool(gate Gate) Tool {
 func (t *WriteFileTool) Name() string { return "write_file" }
 
 func (t *WriteFileTool) Description() string {
-	return "Create a file or overwrite only when the expected file hash matches."
+	return "Create or fully replace a local file. Use expected_sha256 when you need overwrite safety."
 }
 
 func (t *WriteFileTool) Schema() json.RawMessage {

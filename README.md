@@ -124,8 +124,8 @@ Provider selection is automatic:
 ## What You Get
 
 - Interactive TUI with markdown rendering, panes, scrolling transcript, and live stats
-- Coder mode with orchestrator, planner, workflow JSON, review, approve, and execution
-- Built-in tools for reading, editing, searching, running commands, and fetching content
+- Coder mode with planner-backed workflows, review, approve, and execution
+- Built-in tools for reading, editing, searching, running commands, focused web/raw/JSON fetches, and repo cloning
 - File-based sessions under `.apex/sessions/<session-id>/`
 - Structured per-session telemetry with raw LLM I/O, tool arguments, tool results, and provider-reported token usage
 

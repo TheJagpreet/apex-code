@@ -42,41 +42,15 @@ func (e *Engine) SetTelemetrySink(sink func(context.Context, telemetry.SessionEv
 }
 
 func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (domain.CoderWorkflow, error) {
+	prompt = sanitizeWorkflowText(prompt)
 	wf := NewWorkflow(sessionID, prompt)
 	if e.store != nil {
 		if err := e.store.Save(ctx, wf); err != nil {
 			return domain.CoderWorkflow{}, err
 		}
 	}
-	enriched, plannerNotes, rawOrchestrator, err := e.runOrchestrator(ctx, wf)
-	if err != nil {
-		wf.State = domain.WorkflowStateFailed
-		wf.Stages.Orchestrator.Status = "failed"
-		wf.Stages.Orchestrator.Error = err.Error()
-		wf.Stages.Orchestrator.UpdatedAt = time.Now().UTC()
-		appendRun(&wf, domain.WorkflowAgentRun{
-			ID:          runID(),
-			Agent:       domain.WorkflowAgentOrchestrator,
-			Reason:      "enrich initial coder request",
-			Input:       prompt,
-			Error:       err.Error(),
-			StartedAt:   time.Now().UTC(),
-			CompletedAt: time.Now().UTC(),
-		})
-		if e.store != nil {
-			_ = e.store.Save(ctx, wf)
-		}
-		return domain.CoderWorkflow{}, err
-	}
-	wf.Stages.Orchestrator.Status = "done"
-	wf.Stages.Orchestrator.Input = prompt
-	wf.Stages.Orchestrator.Output = rawOrchestrator
-	wf.Stages.Orchestrator.Error = ""
-	wf.Stages.Orchestrator.UpdatedAt = time.Now().UTC()
-	wf.EnrichedPrompt = enriched
-	wf.PlannerInstructions = plannerNotes
 	wf.State = domain.WorkflowStatePlanReview
-	plan, rawPlan, plannerInput, err := e.runPlanner(ctx, wf, "")
+	plan, rawPlan, plannerInput, err := e.runPlannerWithQualityRepair(ctx, wf, "", false)
 	if err != nil {
 		wf.State = domain.WorkflowStateFailed
 		wf.Stages.Planner.Status = "failed"
@@ -87,7 +61,7 @@ func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (doma
 			ID:          runID(),
 			Agent:       domain.WorkflowAgentPlanner,
 			Reason:      "draft initial plan",
-			Input:       plannerNotes,
+			Input:       plannerInput,
 			Error:       err.Error(),
 			StartedAt:   time.Now().UTC(),
 			CompletedAt: time.Now().UTC(),
@@ -106,18 +80,9 @@ func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (doma
 	markReadyTasks(&wf)
 	appendRun(&wf, domain.WorkflowAgentRun{
 		ID:          runID(),
-		Agent:       domain.WorkflowAgentOrchestrator,
-		Reason:      "enrich initial coder request",
-		Input:       prompt,
-		Output:      enriched,
-		StartedAt:   time.Now().UTC(),
-		CompletedAt: time.Now().UTC(),
-	})
-	appendRun(&wf, domain.WorkflowAgentRun{
-		ID:          runID(),
 		Agent:       domain.WorkflowAgentPlanner,
 		Reason:      "draft initial plan",
-		Input:       plannerNotes,
+		Input:       plannerInput,
 		Output:      rawPlan,
 		Structured:  map[string]any{"tasks": len(wf.Tasks)},
 		StartedAt:   time.Now().UTC(),
@@ -133,7 +98,7 @@ func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (doma
 
 func (e *Engine) RevisePlan(ctx context.Context, wf domain.CoderWorkflow, revision string) (domain.CoderWorkflow, error) {
 	original := cloneWorkflow(wf)
-	plan, rawPlan, plannerInput, err := e.runPlanner(ctx, wf, revision)
+	plan, rawPlan, plannerInput, err := e.runPlannerWithQualityRepair(ctx, wf, revision, true)
 	if err != nil {
 		wf.Stages.Planner.Status = "failed"
 		wf.Stages.Planner.Input = plannerInput
@@ -186,6 +151,53 @@ func (e *Engine) RevisePlan(ctx context.Context, wf domain.CoderWorkflow, revisi
 	return wf, nil
 }
 
+func (e *Engine) runPlannerWithQualityRepair(ctx context.Context, wf domain.CoderWorkflow, revision string, isRevision bool) (domain.PlannerPlan, string, string, error) {
+	currentRevision := strings.TrimSpace(revision)
+	var (
+		plan         domain.PlannerPlan
+		rawPlan      string
+		plannerInput string
+		err          error
+	)
+	for attempt := 0; attempt < 3; attempt++ {
+		plan, rawPlan, plannerInput, err = e.runPlanner(ctx, wf, currentRevision)
+		if err != nil {
+			return domain.PlannerPlan{}, rawPlan, plannerInput, err
+		}
+		if issue := plannerQualityIssue(wf.UserPrompt, plan); issue != "" {
+			currentRevision = plannerRepairRevision(currentRevision, issue, isRevision, attempt)
+			continue
+		}
+		return plan, rawPlan, plannerInput, nil
+	}
+	return domain.PlannerPlan{}, rawPlan, plannerInput, fmt.Errorf("planner could not produce an acceptable workflow after repeated repairs")
+}
+
+func plannerRepairRevision(revision, issue string, isRevision bool, attempt int) string {
+	revision = strings.TrimSpace(revision)
+	var b strings.Builder
+	if revision != "" {
+		b.WriteString(revision)
+		b.WriteString("\n\n")
+	}
+	if isRevision {
+		if attempt == 0 {
+			b.WriteString("Your previous revision still was not acceptable.\n")
+		} else {
+			fmt.Fprintf(&b, "Your previous revision still was not acceptable after %d repair attempt(s).\n", attempt)
+		}
+	} else {
+		if attempt == 0 {
+			b.WriteString("Your previous plan was not acceptable.\n")
+		} else {
+			fmt.Fprintf(&b, "Your previous plan was not acceptable after %d repair attempt(s).\n", attempt)
+		}
+	}
+	b.WriteString(issue)
+	b.WriteString("\nReturn a revised plan that keeps the workflow minimal while still covering the real work.")
+	return b.String()
+}
+
 func (e *Engine) ApprovePlan(ctx context.Context, wf domain.CoderWorkflow) (domain.CoderWorkflow, error) {
 	wf.State = domain.WorkflowStateApproved
 	wf.UpdatedAt = time.Now().UTC()
@@ -215,11 +227,7 @@ func (e *Engine) execute(ctx context.Context, wf domain.CoderWorkflow, onProgres
 		markReadyTasks(&wf)
 		task, ok := nextRunnableTask(wf)
 		if !ok {
-			if allDone(wf) {
-				wf.State = domain.WorkflowStateCompleted
-			} else {
-				wf.State = domain.WorkflowStatePaused
-			}
+			wf.State = terminalWorkflowState(wf)
 			break
 		}
 		idx := findTaskIndex(wf, task.ID)
@@ -306,47 +314,9 @@ func (e *Engine) LatestBySession(ctx context.Context, sessionID string) (domain.
 	return e.store.LatestBySession(ctx, sessionID)
 }
 
-func (e *Engine) runOrchestrator(ctx context.Context, wf domain.CoderWorkflow) (string, string, string, error) {
-	type orchestratorOutput struct {
-		EnrichedPrompt      string `json:"enriched_prompt"`
-		PlannerInstructions string `json:"planner_instructions"`
-	}
-	out := orchestratorOutput{}
-	raw, usage, stopReason, duration, err := e.runJSONTurn(ctx, []domain.Message{
-		{Role: domain.RoleSystem, Content: orchestratorPrompt},
-		{Role: domain.RoleUser, Content: wf.UserPrompt},
-	}, &out)
-	if err != nil {
-		return "", "", raw, err
-	}
-	e.recordTelemetry(ctx, telemetry.SessionEvent{
-		Mode:             "coder",
-		Kind:             "stage_llm",
-		Model:            "",
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		TotalTokens:      usage.TotalTokens,
-		CacheCreation:    usage.CacheCreationTokens,
-		CacheRead:        usage.CacheReadTokens,
-		DurationMs:       duration.Milliseconds(),
-		Termination:      string(stopReason),
-		WorkflowID:       wf.ID,
-		Agent:            string(domain.WorkflowAgentOrchestrator),
-		InputMessages:    cloneDomainMessages([]domain.Message{{Role: domain.RoleSystem, Content: orchestratorPrompt}, {Role: domain.RoleUser, Content: wf.UserPrompt}}),
-		OutputMessage:    &domain.Message{Role: domain.RoleAssistant, Content: strings.TrimSpace(raw)},
-	})
-	if strings.TrimSpace(out.EnrichedPrompt) == "" {
-		out.EnrichedPrompt = strings.TrimSpace(raw)
-	}
-	return out.EnrichedPrompt, out.PlannerInstructions, raw, nil
-}
-
 func (e *Engine) runPlanner(ctx context.Context, wf domain.CoderWorkflow, revision string) (domain.PlannerPlan, string, string, error) {
 	var out domain.PlannerPlan
-	input := wf.EnrichedPrompt
-	if strings.TrimSpace(input) == "" {
-		input = wf.UserPrompt
-	}
+	input := wf.UserPrompt
 	if strings.TrimSpace(revision) != "" {
 		input += "\n\nPlan revision request:\n" + strings.TrimSpace(revision)
 	}
@@ -455,6 +425,7 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 	messages := []domain.Message{
 		{Role: domain.RoleSystem, Content: systemPrompt},
 		{Role: domain.RoleSystem, Content: executionGuardPrompt},
+		{Role: domain.RoleSystem, Content: executionEnvironmentPrompt},
 		{Role: domain.RoleSystem, Content: "Workflow execution context:\n" + taskExecutionContext(wf, task)},
 	}
 	if directive := taskExecutionDirective(task); strings.TrimSpace(directive) != "" {
@@ -479,6 +450,7 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 	}
 	raw := state.FinalResponse.Message.Content
 	out := decodeExecutionDisposition(raw)
+	out = enforceExecutionOutcome(task, state, raw, out)
 	idx := findTaskIndex(wf, task.ID)
 	if idx >= 0 {
 		switch strings.ToLower(strings.TrimSpace(out.Status)) {
@@ -555,6 +527,31 @@ type executionDisposition struct {
 	PlanMutations []domain.WorkflowMutation
 }
 
+func enforceExecutionOutcome(task domain.WorkflowTask, state agent.LoopState, raw string, out executionDisposition) executionDisposition {
+	status := strings.ToLower(strings.TrimSpace(out.Status))
+	if status == "" {
+		status = "done"
+	}
+	out.Status = status
+	if status == "blocked" || status == "failed" || status == "needs_replan" {
+		return out
+	}
+	if containsPseudoToolMarkup(raw) {
+		out.Status = "blocked"
+		out.Summary = "Agent returned pseudo-tool markup instead of using actual tool calls."
+		return out
+	}
+	if taskRequiresWorkspaceMutation(task) && !hasMutationEvidence(task, state) {
+		out.Status = "blocked"
+		if strings.TrimSpace(out.Summary) == "" {
+			out.Summary = "Task required workspace changes, but no successful file mutation evidence was recorded."
+		} else {
+			out.Summary = "Task required workspace changes, but no successful file mutation evidence was recorded. Latest agent summary: " + strings.TrimSpace(out.Summary)
+		}
+	}
+	return out
+}
+
 func (e *Engine) finalizeExecutionState(ctx context.Context, task domain.WorkflowTask, systemPrompt string, opts agent.Options, state agent.LoopState) (agent.LoopState, error) {
 	if state.FinalResponse != nil || state.TerminationReason != agent.TerminationMaxIterations {
 		return state, nil
@@ -563,7 +560,8 @@ func (e *Engine) finalizeExecutionState(ctx context.Context, task domain.Workflo
 	finalizeInstruction := "Stop using tools now. Based only on the repository evidence already collected, return the final task result immediately as concise plain text. " +
 		"Do not inspect more files. Do not ask questions. If you have enough evidence for a best-effort task result, give the best concise summary you can. " +
 		"Prefix the response with 'BLOCKED:' only when a required external dependency, missing file, or tool failure truly prevents meaningful completion. " +
-		"Prefix the response with 'NEEDS_REPLAN:' only when the current plan is no longer viable."
+		"Prefix the response with 'NEEDS_REPLAN:' only when the current plan is no longer viable. " +
+		"Do not emit XML, DSML, or pseudo tool-call markup."
 	if task.OwnerAgent == domain.WorkflowAgentSolutioner {
 		finalizeInstruction += " If this task required creating, editing, or deleting files and that change did not already happen through successful tool calls, do not claim success; instead respond with 'BLOCKED:' and explain what did not happen."
 	}
@@ -612,7 +610,7 @@ func decodeExecutionDisposition(raw string) executionDisposition {
 		}
 	}
 	text := strings.TrimSpace(raw)
-	lower := strings.ToLower(text)
+	lower := strings.ToLower(strings.ReplaceAll(text, "*", ""))
 	switch {
 	case strings.HasPrefix(lower, "blocked:"):
 		return executionDisposition{
@@ -628,6 +626,18 @@ func decodeExecutionDisposition(raw string) executionDisposition {
 		return executionDisposition{
 			Status:  "needs_replan",
 			Summary: strings.TrimSpace(text[len("replan:"):]),
+		}
+	case strings.Contains(lower, "needs_replan:"):
+		idx := strings.Index(lower, "needs_replan:")
+		return executionDisposition{
+			Status:  "needs_replan",
+			Summary: strings.TrimSpace(text[idx+len("needs_replan:"):]),
+		}
+	case strings.Contains(lower, "blocked:"):
+		idx := strings.Index(lower, "blocked:")
+		return executionDisposition{
+			Status:  "blocked",
+			Summary: strings.TrimSpace(text[idx+len("blocked:"):]),
 		}
 	default:
 		return executionDisposition{
@@ -801,6 +811,12 @@ func normalizePlannerPlan(plan *domain.PlannerPlan) {
 		plan.Tasks[i].Phase = strings.TrimSpace(plan.Tasks[i].Phase)
 		plan.Tasks[i].Title = strings.TrimSpace(plan.Tasks[i].Title)
 		plan.Tasks[i].Description = strings.TrimSpace(plan.Tasks[i].Description)
+		for j := range plan.Tasks[i].AcceptanceCriteria {
+			plan.Tasks[i].AcceptanceCriteria[j] = strings.TrimSpace(plan.Tasks[i].AcceptanceCriteria[j])
+		}
+		for j := range plan.Tasks[i].Outputs {
+			plan.Tasks[i].Outputs[j] = strings.TrimSpace(plan.Tasks[i].Outputs[j])
+		}
 		plan.Tasks[i].OwnerAgent = normalizeTaskOwner(plan.Tasks[i])
 		for j := range plan.Tasks[i].Dependencies {
 			plan.Tasks[i].Dependencies[j] = strings.TrimSpace(plan.Tasks[i].Dependencies[j])
@@ -812,6 +828,7 @@ func validatePlannerPlan(plan domain.PlannerPlan) error {
 	if len(plan.Tasks) == 0 {
 		return fmt.Errorf("planner returned no tasks")
 	}
+	taskIndex := make(map[string]domain.WorkflowTask, len(plan.Tasks))
 	for _, task := range plan.Tasks {
 		if strings.TrimSpace(task.ID) == "" {
 			return fmt.Errorf("planner task is missing id")
@@ -822,22 +839,206 @@ func validatePlannerPlan(plan domain.PlannerPlan) error {
 		if strings.TrimSpace(task.Description) == "" {
 			return fmt.Errorf("planner task %q is missing description", task.ID)
 		}
+		if _, exists := taskIndex[task.ID]; exists {
+			return fmt.Errorf("planner returned duplicate task id %q", task.ID)
+		}
+		if task.OwnerAgent == "" {
+			return fmt.Errorf("planner task %q is missing owner_agent", task.ID)
+		}
+		switch task.OwnerAgent {
+		case domain.WorkflowAgentArchitecture, domain.WorkflowAgentSolutioner, domain.WorkflowAgentTester, domain.WorkflowAgentReviewer:
+		default:
+			return fmt.Errorf("planner task %q has invalid owner_agent %q", task.ID, task.OwnerAgent)
+		}
+		taskIndex[task.ID] = task
+	}
+	for _, task := range plan.Tasks {
+		for _, dep := range task.Dependencies {
+			if dep == task.ID {
+				return fmt.Errorf("planner task %q depends on itself", task.ID)
+			}
+			if _, exists := taskIndex[dep]; !exists {
+				return fmt.Errorf("planner task %q depends on unknown task %q", task.ID, dep)
+			}
+		}
+	}
+	if len(plan.Phases) == 0 {
+		return fmt.Errorf("planner returned no phases")
+	}
+	phaseTaskRefs := make(map[string]struct{}, len(plan.Tasks))
+	for _, phase := range plan.Phases {
+		if strings.TrimSpace(phase.Name) == "" {
+			return fmt.Errorf("planner phase is missing name")
+		}
+		for _, taskID := range phase.TaskIDs {
+			if _, exists := taskIndex[taskID]; !exists {
+				return fmt.Errorf("planner phase %q references unknown task %q", phase.Name, taskID)
+			}
+			phaseTaskRefs[taskID] = struct{}{}
+		}
+	}
+	for _, task := range plan.Tasks {
+		if _, exists := phaseTaskRefs[task.ID]; !exists {
+			return fmt.Errorf("planner task %q is not referenced by any phase", task.ID)
+		}
 	}
 	return nil
 }
 
+func plannerQualityIssue(userPrompt string, plan domain.PlannerPlan) string {
+	promptText := strings.ToLower(strings.TrimSpace(userPrompt))
+	if issue := repoLearningPlanIssue(promptText, plan); issue != "" {
+		return issue
+	}
+	if len(plan.Tasks) <= 3 {
+		return ""
+	}
+	metaTasks := 0
+	implementationTasks := 0
+	for _, task := range plan.Tasks {
+		text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description))
+		if taskRequiresWorkspaceMutation(task) {
+			implementationTasks++
+		}
+		if strings.Contains(text, "requirement") ||
+			strings.Contains(text, "architecture") ||
+			strings.Contains(text, "design") ||
+			strings.Contains(text, "test plan") ||
+			strings.Contains(text, "review") {
+			metaTasks++
+		}
+	}
+	isLikelyTrivial := len(plan.Tasks) > 4 &&
+		!strings.Contains(promptText, "workflow") &&
+		!strings.Contains(promptText, "architecture") &&
+		!strings.Contains(promptText, "design doc") &&
+		!strings.Contains(promptText, "migration") &&
+		!strings.Contains(promptText, "refactor")
+	if isLikelyTrivial && metaTasks >= 3 && implementationTasks <= 1 {
+		return "The plan is over-segmented for a simple request. Do not create separate tasks for requirements gathering, architecture writeups, test planning, and review unless the user explicitly asked for them. Prefer one implementation task, optionally followed by one verification or review task when genuinely needed."
+	}
+	if isLikelySmallArtifactRequest(promptText) && len(plan.Tasks) > 3 {
+		return "The plan is too large for a small file-creation request. When the user asks for a script plus a few companion files in the current folder, prefer one implementation task or at most two tasks with a final validation/documentation step. Avoid separate research, setup, and file-by-file tasks unless the work is genuinely large or risky."
+	}
+	return ""
+}
+
+func repoLearningPlanIssue(promptText string, plan domain.PlannerPlan) string {
+	if !promptNeedsRepoLearning(promptText) {
+		return ""
+	}
+	researchTaskIDs := make(map[string]struct{})
+	for _, task := range plan.Tasks {
+		if !taskRequiresWorkspaceMutation(task) {
+			researchTaskIDs[task.ID] = struct{}{}
+		}
+	}
+	for _, task := range plan.Tasks {
+		if !taskRequiresWorkspaceMutation(task) {
+			continue
+		}
+		text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description))
+		if task.OwnerAgent == domain.WorkflowAgentArchitecture {
+			return "A task that creates or edits files must not be assigned to architecture. Use architecture only for repository-reading handoffs, and assign implementation to solutioner."
+		}
+		hasResearchDependency := false
+		for _, dep := range task.Dependencies {
+			if _, ok := researchTaskIDs[dep]; ok {
+				hasResearchDependency = true
+				break
+			}
+		}
+		if mentionsRepoLearning(text) && !hasResearchDependency {
+			return "The plan jumps straight from 'read the repo/README/spec' to implementation in the same task. For requests that require learning an external repository before creating artifacts, use a compact handoff: one research task that extracts the usage facts from the repo, then one implementation task that creates the files from that handoff. Do not invent schemas, file conventions, or APIs before the research handoff exists."
+		}
+	}
+	return ""
+}
+
+func promptNeedsRepoLearning(promptText string) bool {
+	if !strings.Contains(promptText, "github.com/") && !strings.Contains(promptText, "readme") && !strings.Contains(promptText, "read this repo") && !strings.Contains(promptText, "project: http") {
+		return false
+	}
+	for _, marker := range []string{"know how to use it", "read the readme", "read this repo", "readme of this project", "understand"} {
+		if strings.Contains(promptText, marker) {
+			return true
+		}
+	}
+	return strings.Contains(promptText, "github.com/") && strings.Contains(promptText, "create ")
+}
+
+func mentionsRepoLearning(text string) bool {
+	if strings.Contains(text, "readme") && (strings.Contains(text, "read ") || strings.Contains(text, "inspect ") || strings.Contains(text, "understand ")) {
+		return true
+	}
+	for _, marker := range []string{
+		"read the readme",
+		"readme of ",
+		"read this repo",
+		"visit the github repo",
+		"understand the",
+		"as shown in the readme",
+		"according to the readme",
+		"based on the readme",
+		"github.com/",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLikelySmallArtifactRequest(promptText string) bool {
+	if strings.Contains(promptText, "migration") ||
+		strings.Contains(promptText, "refactor") ||
+		strings.Contains(promptText, "architecture") ||
+		strings.Contains(promptText, "design doc") ||
+		strings.Contains(promptText, "workflow") {
+		return false
+	}
+	fileTerms := 0
+	for _, marker := range []string{"script", "readme", "package.json", "sample.json", ".js", ".json", ".md", "in this folder", "create a"} {
+		if strings.Contains(promptText, marker) {
+			fileTerms++
+		}
+	}
+	return fileTerms >= 3
+}
+
 func normalizeTaskOwner(task domain.WorkflowTask) domain.WorkflowAgent {
-	switch task.OwnerAgent {
-	case domain.WorkflowAgentArchitecture, domain.WorkflowAgentSolutioner, domain.WorkflowAgentTester, domain.WorkflowAgentReviewer:
-		return task.OwnerAgent
+	if taskRequiresWorkspaceMutation(task) {
+		text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description))
+		if strings.Contains(text, "test") || strings.Contains(text, "verify") || strings.Contains(text, "validation") {
+			return domain.WorkflowAgentTester
+		}
+		if strings.Contains(text, "review") {
+			return domain.WorkflowAgentReviewer
+		}
+		return domain.WorkflowAgentSolutioner
 	}
 	text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description))
+	switch task.OwnerAgent {
+	case domain.WorkflowAgentTester, domain.WorkflowAgentReviewer:
+		return task.OwnerAgent
+	case domain.WorkflowAgentArchitecture:
+		return domain.WorkflowAgentArchitecture
+	}
 	switch {
 	case strings.Contains(text, "review"), strings.Contains(text, "regression"), strings.Contains(text, "bug risk"):
 		return domain.WorkflowAgentReviewer
 	case strings.Contains(text, "test"), strings.Contains(text, "verify"), strings.Contains(text, "validation"), strings.Contains(text, "assert"):
 		return domain.WorkflowAgentTester
-	case strings.Contains(text, "architecture"), strings.Contains(text, "design"), strings.Contains(text, "data flow"), strings.Contains(text, "codebase"):
+	case strings.Contains(text, "architecture"),
+		strings.Contains(text, "design"),
+		strings.Contains(text, "data flow"),
+		strings.Contains(text, "codebase"),
+		strings.Contains(text, "readme"),
+		strings.Contains(text, "spec"),
+		strings.Contains(text, "repository"),
+		strings.Contains(text, "repo"),
+		strings.Contains(text, "summarize usage"),
+		strings.Contains(text, "extract usage facts"):
 		return domain.WorkflowAgentArchitecture
 	default:
 		return domain.WorkflowAgentSolutioner
@@ -914,12 +1115,26 @@ func compactHandoffOutputs(outputs []string) []string {
 }
 
 func taskExecutionDirective(task domain.WorkflowTask) string {
+	remoteRepoNote := remoteRepoDirective(task)
 	if taskRequiresWorkspaceMutation(task) {
-		return ""
+		directive := "This task must produce real workspace changes before it can be marked done. " +
+			"Use dependency handoffs as your source of truth instead of re-researching unless a required detail is genuinely missing. " +
+			"If the task expects files, create or update them with successful workspace tools and then stop. " +
+			"If you cannot produce the required files or outputs, return 'BLOCKED:' with the concrete missing prerequisite. " +
+			"Never emit pseudo tool-call syntax in plain text; either use the real tool channel or return a plain-text final result."
+		if remoteRepoNote != "" {
+			directive += " " + remoteRepoNote
+		}
+		return directive
 	}
-	return "This is a non-mutating task handoff. Prefer using dependency handoffs and evidence already collected by prior tasks. " +
+	directive := "This is a non-mutating task handoff. Prefer using dependency handoffs and evidence already collected by prior tasks. " +
 		"Do not create or modify files unless the task description explicitly requires it. " +
-		"Do not reopen the repository broadly if the handoff already provides enough information to answer."
+		"Do not reopen the repository broadly if the handoff already provides enough information to answer. " +
+		"Do not start implementation; stop as soon as you can return the concise summary this task needs."
+	if remoteRepoNote != "" {
+		directive += " " + remoteRepoNote
+	}
+	return directive
 }
 
 func taskMaxIterations(task domain.WorkflowTask, current int) int {
@@ -927,11 +1142,21 @@ func taskMaxIterations(task domain.WorkflowTask, current int) int {
 		current = 50
 	}
 	if taskRequiresWorkspaceMutation(task) {
+		limit := 10
+		if task.OwnerAgent == domain.WorkflowAgentSolutioner {
+			limit = 12
+		}
+		if current > limit {
+			return limit
+		}
 		return current
 	}
-	limit := 8
-	if task.OwnerAgent == domain.WorkflowAgentArchitecture || task.OwnerAgent == domain.WorkflowAgentReviewer {
-		limit = 16
+	limit := 4
+	switch task.OwnerAgent {
+	case domain.WorkflowAgentTester:
+		limit = 4
+	case domain.WorkflowAgentArchitecture, domain.WorkflowAgentReviewer:
+		limit = 5
 	}
 	if current > limit {
 		return limit
@@ -941,19 +1166,174 @@ func taskMaxIterations(task domain.WorkflowTask, current int) int {
 
 func taskRequiresWorkspaceMutation(task domain.WorkflowTask) bool {
 	text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description + "\n" + strings.Join(task.AcceptanceCriteria, "\n") + "\n" + strings.Join(task.Outputs, "\n")))
-	for _, marker := range []string{
-		"create file", "write file", "write ", "edit ", "modify ", "update ", "delete ",
-		"overwrite ", "patch ", "run the script", "execute ", "save ", "generate file",
-		"exists at", "file exists", ".md file", ".go file", ".txt file", ".json file", ".toml file", ".yml file", ".yaml file",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
+	if taskHasExpectedFileOutputs(task) {
+		return true
 	}
 	if strings.Contains(text, "transient, internal") || strings.Contains(text, "design notes") || strings.Contains(text, "flow map notes") {
 		return false
 	}
+	hasMutationVerb := false
+	for _, marker := range []string{
+		"create ", "write ", "edit ", "modify ", "update ", "delete ",
+		"overwrite ", "patch ", "save ", "generate ", "add ",
+	} {
+		if strings.Contains(text, marker) {
+			hasMutationVerb = true
+			break
+		}
+	}
+	if !hasMutationVerb {
+		return false
+	}
+	if strings.Contains(text, "create file") ||
+		strings.Contains(text, "write file") ||
+		strings.Contains(text, "edit file") ||
+		strings.Contains(text, "update file") ||
+		strings.Contains(text, "file exists") ||
+		strings.Contains(text, " folder") ||
+		strings.Contains(text, " directory") ||
+		strings.Contains(text, " workspace") ||
+		looksLikeFilePath(text) {
+		return true
+	}
 	return false
+}
+
+func taskHasExpectedFileOutputs(task domain.WorkflowTask) bool {
+	for _, output := range task.Outputs {
+		if looksLikeFilePath(output) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeFilePath(text string) bool {
+	for _, token := range strings.FieldsFunc(text, splitPathishFields) {
+		if isLikelyFileToken(token) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitPathishFields(r rune) bool {
+	switch r {
+	case ' ', '\n', '\r', '\t', ',', ';', '(', ')', '[', ']', '{', '}', '"', '\'', '`':
+		return true
+	default:
+		return false
+	}
+}
+
+func isLikelyFileToken(token string) bool {
+	token = strings.TrimSpace(strings.Trim(token, "<>"))
+	if token == "" {
+		return false
+	}
+	lower := strings.ToLower(token)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return false
+	}
+	if strings.Contains(lower, "scratchpad") || strings.Contains(lower, "memory") {
+		return false
+	}
+	if strings.ContainsAny(token, `/\`) {
+		parts := strings.FieldsFunc(token, func(r rune) bool { return r == '/' || r == '\\' })
+		if len(parts) == 0 {
+			return false
+		}
+		token = parts[len(parts)-1]
+		lower = strings.ToLower(token)
+	}
+	token = strings.TrimRight(token, ".:)")
+	if token == "" || strings.HasPrefix(token, ".") && !strings.Contains(token[1:], ".") {
+		return false
+	}
+	dot := strings.LastIndex(token, ".")
+	if dot <= 0 || dot >= len(token)-1 {
+		return false
+	}
+	ext := token[dot+1:]
+	if len(ext) > 8 {
+		return false
+	}
+	for _, ch := range ext {
+		if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func hasMutationEvidence(task domain.WorkflowTask, state agent.LoopState) bool {
+	fileOutputs := taskHasExpectedFileOutputs(task)
+	for _, turn := range state.Turns {
+		for i, call := range turn.ToolCalls {
+			var result domain.ToolResult
+			if i < len(turn.ToolResults) {
+				result = turn.ToolResults[i]
+			}
+			if result.IsError {
+				continue
+			}
+			switch call.Name {
+			case "write_file", "edit":
+				return true
+			case "run":
+				if !fileOutputs {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func containsPseudoToolMarkup(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	for _, marker := range []string{
+		"<｜｜dsml｜｜tool_calls>",
+		"<||dsml||tool_calls>",
+		"<｜｜dsml｜｜invoke",
+		"<||dsml||invoke",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteRepoDirective(task domain.WorkflowTask) string {
+	text := task.Title + "\n" + task.Description + "\n" + strings.Join(task.AcceptanceCriteria, "\n")
+	if !strings.Contains(strings.ToLower(text), "github.com/") {
+		return ""
+	}
+	return "If the task depends on a remote GitHub repository or spec in enough detail to implement code correctly, do not rely on repeated truncated webpage fetches alone. Prefer clone_repo to materialize the repository locally, then inspect files with list_dir, glob, and read_file. Use fetch_raw for exact remote markdown/source files and fetch_json for JSON APIs. Do not treat truncated remote fetch output as a blocker when a local clone or exact raw file fetch is available."
+}
+
+func terminalWorkflowState(wf domain.CoderWorkflow) domain.WorkflowState {
+	if allDone(wf) {
+		return domain.WorkflowStateCompleted
+	}
+	hasNeedsPlan := false
+	hasBlocked := false
+	for _, task := range wf.Tasks {
+		switch task.Status {
+		case domain.WorkflowTaskNeedsPlan:
+			hasNeedsPlan = true
+		case domain.WorkflowTaskBlocked:
+			hasBlocked = true
+		}
+	}
+	if hasNeedsPlan {
+		return domain.WorkflowStatePlanReview
+	}
+	if hasBlocked {
+		return domain.WorkflowStateFailed
+	}
+	return domain.WorkflowStatePaused
 }
 
 func containsTaskID(items []string, want string) bool {
@@ -1005,14 +1385,6 @@ func allDone(wf domain.CoderWorkflow) bool {
 	return true
 }
 
-const orchestratorPrompt = `You are the orchestrator for apex-code coder mode.
-Return strict JSON with keys:
-- enriched_prompt: a concise but richer version of the user request
-- planner_instructions: extra constraints or sequencing hints for the planner
-The Go engine owns the workflow state machine and JSON file.
-You only return content for this stage.
-No markdown, no prose outside JSON.`
-
 const plannerPrompt = `You are the planner for apex-code coder mode.
 Return strict JSON with keys:
 - summary: one short summary sentence
@@ -1032,9 +1404,14 @@ Each task object must include:
 
 Allowed owner_agent values: architecture, solutioner, tester, reviewer.
 Allowed status values: pending.
+Plan for execution quality, not ceremony.
+Prefer the smallest viable workflow that can complete the user request safely.
+For small or single-file tasks, prefer 1 task, or 2 tasks when a separate validation/review step is genuinely useful.
+Do not create standalone tasks for requirements gathering, architecture narration, test planning, or review unless the user explicitly asked for those deliverables or the work is genuinely large and risky.
+Each task should give the assigned agent just the concrete slice of work it needs so later agents can rely on handoffs instead of redoing earlier analysis.
 The Go engine owns the authoritative workflow JSON and task lifecycle.
 You only return the planner stage payload.
-Never assign execution tasks to orchestrator or planner. Those agents are stage-only and do not execute workflow tasks.
+Never assign execution tasks to planner. The planner is stage-only and does not execute workflow tasks.
 No markdown, no prose outside JSON.`
 
 const architecturePrompt = `You are the architecture agent in apex-code coder mode.
@@ -1050,7 +1427,14 @@ Use tools when the task depends on real repository state.`
 const executionGuardPrompt = `You are operating on a real workspace.
 Use tools for repository inspection, file edits, and command execution whenever the task depends on real workspace state.
 Never claim you changed a file, ran a command, or verified a fix unless the corresponding tool actually succeeded.
-For file edits, prefer read_file before edit or write_file, and summarize the actual tool outcomes.`
+For file edits, prefer read_file before edit or write_file, and summarize the actual tool outcomes.
+Never emit XML, DSML, or pseudo tool-call markup in assistant text. Use actual tool calls or a plain-text final answer only.`
+
+const executionEnvironmentPrompt = `Execution environment constraints:
+- The current shell may be Windows PowerShell. Do not assume bash, Linux paths, or POSIX utilities.
+- Avoid commands such as &&, ls -la, grep, head, find /, /tmp, /workspace, and /dev/null unless you have confirmed they are valid in the current shell.
+- Prefer built-in repository tools like list_dir, glob, grep, read_file, fetch_web, fetch_raw, fetch_json, clone_repo, write_file, and edit over shell exploration when possible.
+- If you use the run tool, write a command that is valid for the current shell and workspace.`
 
 const solutionerPrompt = `You are the solutioner agent in apex-code coder mode.
 Implement the task in the real workspace.
@@ -1066,6 +1450,8 @@ Run or select the right validations for the current task.
 Answer with a concise plain-text task result summarizing the validation outcome.
 Once you have enough validation evidence, stop and return the result immediately.
 Avoid repeating the same tool call for the same file or line range unless a previous tool result failed.
+Prefer the simplest validation path that can prove the behavior. Reuse dependency handoffs and successful command output when they already satisfy the acceptance criteria.
+Do not create helper scripts or elaborate test harnesses unless a direct command, existing test, or short built-in validation is insufficient.
 Prefer status=done when you can report the best available validation result. Use blocked only for real external blockers.
 If the task is truly blocked, prefix the response with 'BLOCKED:'.
 If the task needs replanning, prefix the response with 'NEEDS_REPLAN:'.

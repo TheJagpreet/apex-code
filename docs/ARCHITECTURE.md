@@ -33,7 +33,6 @@ Coder mode adds one more layer on top:
 
 ```text
 user prompt
-  -> orchestrator enrichment
   -> planner JSON workflow
   -> user review / approve
   -> task execution via role-specific agent runs
@@ -172,7 +171,8 @@ Owns the built-in tool system:
 - output/result shaping
 
 Built-in tools currently include file reads/writes/edits, search, shell execution,
-directory listing, globbing, and URL fetch.
+directory listing, globbing, webpage fetch, raw remote file fetch, JSON fetch, and
+repo cloning.
 
 ### `internal/codermode`
 
@@ -181,7 +181,6 @@ Implements workflow-backed coding mode.
 Responsibilities:
 
 - create workflow JSON from a user prompt
-- run orchestrator enrichment
 - run planner JSON generation
 - support replan / approve / execute
 - execute tasks through role-specific prompts
@@ -349,13 +348,12 @@ Coder mode introduces a persisted workflow layer.
 Sequence:
 
 1. User enters a long-running coding request
-2. Orchestrator enriches the request
-3. Planner emits strict JSON tasks/phases
-4. Workflow is written to `.apex/sessions/<session-id>/workflows/`
-5. User reviews in the TUI plan pane
-6. `/approve` starts task execution
-7. Each task is executed through the shared agent loop with a role-specific prompt
-8. Results are appended to workflow history and shown in the plan pane
+2. Planner emits strict JSON tasks/phases
+3. Workflow is written to `.apex/sessions/<session-id>/workflows/`
+4. User reviews in the TUI plan pane
+5. `/approve` starts task execution
+6. Each task is executed through the shared agent loop with a role-specific prompt
+7. Results are appended to workflow history and shown in the plan pane
 
 So coder mode is not a second independent backend. It is a workflow layer above
 the same provider/tool/agent infrastructure used by chat mode.
@@ -395,7 +393,8 @@ estimation.
 - tool-call names and tool-result counts
 
 The TUI status bar token counter is a session-level running total rather than a
-single-request snapshot.
+single-request snapshot, and it refreshes from live session telemetry while requests
+are in flight.
 
 ## Current practical tradeoffs
 

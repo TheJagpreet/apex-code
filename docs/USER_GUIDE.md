@@ -15,8 +15,9 @@ The TUI is a full Bubble Tea workspace rather than a scrolling log:
 - Auxiliary panes for tools, diffs, context, stats, help, and the coder plan
 - Multiline composer with `Shift+Enter`
 
-The live `tok` value in the header is the net session token total, updated as each
-LLM call completes in chat mode or coder mode.
+The live `tok` value in the header is the net session token total. It updates
+continuously from shared session telemetry while chat mode or coder mode is making
+LLM calls, rather than waiting for the next transcript event.
 
 ## Chat mode and coder mode
 
@@ -34,12 +35,11 @@ Switch directly with:
 
 Coder mode adds a workflow-oriented execution path for longer jobs:
 
-1. Your prompt is enriched by the orchestrator.
-2. The planner emits a JSON workflow with phases and tasks.
-3. You review the plan in the TUI.
-4. You can revise it with `/replan <feedback>`.
-5. You approve it with `/approve`.
-6. Tasks run through specialized agents such as `architecture`, `solutioner`,
+1. The planner emits a JSON workflow with phases and tasks.
+2. You review the plan in the TUI.
+3. You can revise it with `/replan <feedback>`.
+4. You approve it with `/approve`, which starts execution.
+5. Tasks run through specialized agents such as `architecture`, `solutioner`,
    `tester`, and `reviewer`.
 
 Workflow JSON files are stored under the active session folder in `workflows/`.
@@ -82,7 +82,10 @@ Built-in tools currently include:
 - `glob`
 - `grep`
 - `run`
-- `fetch`
+- `fetch_web`
+- `fetch_raw`
+- `fetch_json`
+- `clone_repo`
 
 Tool activity appears in the tools pane, and edits surface in the diffs pane before
 they land.

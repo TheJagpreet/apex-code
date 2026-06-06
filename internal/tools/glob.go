@@ -26,7 +26,7 @@ func NewGlobTool(gate Gate) Tool {
 func (t *GlobTool) Name() string { return "glob" }
 
 func (t *GlobTool) Description() string {
-	return "Find files by glob pattern. Results are sorted and capped."
+	return "Find local file paths by glob pattern. Use this for discovery when you know the filename shape."
 }
 
 func (t *GlobTool) Schema() json.RawMessage {

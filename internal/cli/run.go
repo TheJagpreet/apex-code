@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apex-code/apex/internal/agent"
@@ -65,6 +66,8 @@ type Deps struct {
 	SessionTotalTokens int
 	Initial            []domain.Message
 	cfg                Config
+	sessionMu          sync.RWMutex
+	sessionPendingTokens int
 }
 
 // BuildDeps assembles the provider, tool registry, context manager, and the
@@ -188,6 +191,7 @@ func (d *Deps) systemMessage() (domain.Message, bool) {
 	b.WriteString("Use tools for repository inspection, file edits, and command execution whenever the task depends on real workspace state.\n")
 	b.WriteString("Never claim you changed a file, ran a command, or verified a fix unless the corresponding tool actually succeeded.\n")
 	b.WriteString("For file edits, prefer read_file before edit/write_file, and summarize the real outcome of the tool calls.\n")
+	b.WriteString("For remote resources, choose the narrowest tool that matches the job: fetch_web for webpages, fetch_raw for exact remote text/files, fetch_json for JSON APIs, and clone_repo when you need to inspect a remote repository locally.\n")
 	if d.cfg.LazyTools {
 		b.WriteString("\nAvailable tools (ask for one by name to use it):\n")
 		b.WriteString(d.Registry.DescribeDeferred())
@@ -270,6 +274,10 @@ func (d *Deps) RunConversationStream(ctx context.Context, messages []domain.Mess
 func (d *Deps) runConversation(ctx context.Context, messages []domain.Message, onText func(string)) (agent.LoopState, error) {
 	opts := d.Options()
 	opts.StreamText = onText
+	d.resetSessionPendingTokens()
+	opts.OnTurn = func(turn agent.Turn, _ agent.BudgetReport, _, _ int) {
+		d.addSessionPendingTokens(turn.Response.Usage.TotalTokens)
+	}
 	runMessages := cloneMessages(messages)
 	state, err := agent.New(d.Provider, d.Dispatcher).Run(ctx, runMessages, opts)
 	if err == nil && shouldRetryWithToolNudge(runMessages, state) {
@@ -287,6 +295,7 @@ func (d *Deps) runConversation(ctx context.Context, messages []domain.Message, o
 		// Session/telemetry durability is best-effort at the UX boundary.
 		state.LastError = persistErr
 	}
+	d.resetSessionPendingTokens()
 	return state, err
 }
 
@@ -411,17 +420,23 @@ func (d *Deps) effectiveSessionID() string {
 }
 
 func (d *Deps) ensureSessionID() string {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
 	if strings.TrimSpace(d.SessionID) == "" {
 		d.SessionID = uuid.NewString()
 		d.SessionTurnSeq = 0
 		d.SessionTotalTokens = 0
+		d.sessionPendingTokens = 0
 	}
 	return d.SessionID
 }
 
 func (d *Deps) loadSessionTelemetryState(ctx context.Context) {
+	d.sessionMu.Lock()
 	d.SessionTurnSeq = 0
 	d.SessionTotalTokens = 0
+	d.sessionPendingTokens = 0
+	d.sessionMu.Unlock()
 	if d.TelemetryFiles == nil || strings.TrimSpace(d.SessionID) == "" {
 		return
 	}
@@ -429,14 +444,18 @@ func (d *Deps) loadSessionTelemetryState(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	d.sessionMu.Lock()
 	d.SessionTurnSeq = count
 	d.SessionTotalTokens = totals.TotalTokens
+	d.sessionMu.Unlock()
 }
 
 func (d *Deps) appendSessionEvent(ctx context.Context, event telemetry.SessionEvent) error {
 	sessionID := d.ensureSessionID()
+	d.sessionMu.Lock()
 	d.SessionTurnSeq++
 	event.Index = d.SessionTurnSeq
+	d.sessionMu.Unlock()
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
@@ -454,8 +473,36 @@ func (d *Deps) appendSessionEvent(ctx context.Context, event telemetry.SessionEv
 			return err
 		}
 	}
+	d.sessionMu.Lock()
 	d.SessionTotalTokens += event.TotalTokens
+	if d.sessionPendingTokens >= event.TotalTokens {
+		d.sessionPendingTokens -= event.TotalTokens
+	} else {
+		d.sessionPendingTokens = 0
+	}
+	d.sessionMu.Unlock()
 	return nil
+}
+
+func (d *Deps) addSessionPendingTokens(tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	d.sessionMu.Lock()
+	d.sessionPendingTokens += tokens
+	d.sessionMu.Unlock()
+}
+
+func (d *Deps) resetSessionPendingTokens() {
+	d.sessionMu.Lock()
+	d.sessionPendingTokens = 0
+	d.sessionMu.Unlock()
+}
+
+func (d *Deps) currentSessionTokens() int {
+	d.sessionMu.RLock()
+	defer d.sessionMu.RUnlock()
+	return d.SessionTotalTokens + d.sessionPendingTokens
 }
 
 func turnRecords(state agent.LoopState, savedBy map[string]int) []session.TurnRecord {

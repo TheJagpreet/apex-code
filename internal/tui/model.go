@@ -76,6 +76,11 @@ type progressMsg struct {
 	reply Reply
 }
 
+type liveStatusMsg struct {
+	reply Reply
+	err   error
+}
+
 // waitStream blocks on the streaming channel and surfaces the next event as a
 // tea.Msg. It is re-armed after every delta until the final replyMsg arrives.
 func waitStream(ch chan tea.Msg) tea.Cmd {
@@ -221,6 +226,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitStream(m.streamCh)
 
+	case liveStatusMsg:
+		if msg.err == nil {
+			m.budget = msg.reply.Budget
+			if strings.TrimSpace(msg.reply.Stats) != "" {
+				m.stats = msg.reply.Stats
+			}
+			if msg.reply.Workflow != nil {
+				m.workflow = msg.reply.Workflow
+			}
+		}
+		return m, nil
+
 	case tickMsg:
 		if m.working {
 			m.loaderFrame = (m.loaderFrame + 1) % len(loaderGlyphs)
@@ -228,6 +245,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.loaderTicks%5 == 0 {
 				m.loaderPhrase = (m.loaderPhrase + 1) % len(loaderPhrases)
 			}
+		}
+		if m.working {
+			return m, tea.Batch(tickCmd(), liveStatusCmd(m.ctx, m.agent))
 		}
 		return m, tickCmd()
 
@@ -1505,9 +1525,16 @@ func max(a, b int) int {
 var _ = os.ErrNotExist
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func liveStatusCmd(ctx context.Context, agent Agent) tea.Cmd {
+	return func() tea.Msg {
+		reply, err := agent.LiveStatus(ctx)
+		return liveStatusMsg{reply: reply, err: err}
+	}
 }
 
 type animMsg time.Time

@@ -94,6 +94,8 @@ apex mcp [flags]           manage MCP servers
 
 - If the header `tok` value looks high, remember it is the net session token total,
   not the latest single-call token count.
+- The header token value is live session telemetry, so it can move before the next
+  transcript line appears.
 - If coder mode behaves oddly, inspect both the session `telemetry.json` and the
   matching workflow JSON under `workflows/`.
 - If a request exceeds budget, see [CONFIGURATION.md](./CONFIGURATION.md) for the

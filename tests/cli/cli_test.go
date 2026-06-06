@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/apex-code/apex/internal/cli"
+	"github.com/apex-code/apex/internal/domain"
 	"github.com/apex-code/apex/internal/session"
 	"github.com/apex-code/apex/internal/telemetry"
 )
@@ -114,6 +115,30 @@ func TestMainTopLevelStatsFlagOpensDashboard(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Opened stats dashboard:") {
 		t.Fatalf("stats output = %q", stdout)
+	}
+}
+
+func TestComposeCoderPromptIncludesRecentChatContext(t *testing.T) {
+	got := cli.ComposeCoderPrompt("\x00\x00Create the files now", []domain.Message{
+		{Role: domain.RoleSystem, Content: "system"},
+		{Role: domain.RoleUser, Content: "We need a JSON to Toon converter."},
+		{Role: domain.RoleAssistant, Content: "The Toon repo uses indentation for objects and table-like arrays."},
+		{Role: domain.RoleTool, ToolResults: []domain.ToolResult{{ToolCallID: "1", Content: "tool"}}},
+	})
+	if strings.Contains(got, "\x00") {
+		t.Fatalf("compose coder prompt should strip NUL bytes: %q", got)
+	}
+	if !strings.Contains(got, "Current request:\nCreate the files now") {
+		t.Fatalf("compose coder prompt missing current request: %q", got)
+	}
+	if !strings.Contains(got, "Prior conversation context from this session:") {
+		t.Fatalf("compose coder prompt missing context header: %q", got)
+	}
+	if !strings.Contains(got, "user: We need a JSON to Toon converter.") {
+		t.Fatalf("compose coder prompt missing prior user context: %q", got)
+	}
+	if !strings.Contains(got, "assistant: The Toon repo uses indentation for objects and table-like arrays.") {
+		t.Fatalf("compose coder prompt missing prior assistant context: %q", got)
 	}
 }
 

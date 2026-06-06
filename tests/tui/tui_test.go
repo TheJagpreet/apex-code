@@ -33,6 +33,7 @@ func (stubAgent) CoderExecuteStream(context.Context, func(tui.Reply)) (tui.Reply
 	return tui.Reply{}, nil
 }
 func (stubAgent) CoderWorkflow() *domain.CoderWorkflow { return nil }
+func (stubAgent) LiveStatus(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
 
 func TestNewViewShowsCoreChrome(t *testing.T) {
 	model := tui.New(context.Background(), stubAgent{}, false)

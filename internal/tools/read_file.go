@@ -24,7 +24,7 @@ func NewReadFileTool(gate Gate) Tool {
 func (t *ReadFileTool) Name() string { return "read_file" }
 
 func (t *ReadFileTool) Description() string {
-	return "Read a file or line range. Large files require an explicit range."
+	return "Read an exact local file body or line range. Use this for precise source inspection."
 }
 
 func (t *ReadFileTool) Schema() json.RawMessage {

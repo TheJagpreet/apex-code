@@ -101,11 +101,6 @@ func WorkflowBudgetText(wf domain.CoderWorkflow) string {
 	b.WriteString("user_prompt: ")
 	b.WriteString(strings.TrimSpace(wf.UserPrompt))
 	b.WriteString("\n")
-	if strings.TrimSpace(wf.EnrichedPrompt) != "" {
-		b.WriteString("enriched_prompt: ")
-		b.WriteString(strings.TrimSpace(wf.EnrichedPrompt))
-		b.WriteString("\n")
-	}
 	b.WriteString("state: ")
 	b.WriteString(string(wf.State))
 	b.WriteString("\n")

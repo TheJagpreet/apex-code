@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -295,19 +296,94 @@ func TestRunToolCompactOutput(t *testing.T) {
 	}
 }
 
-func TestFetchToolExtractsPlainText(t *testing.T) {
+func TestFetchWebToolExtractsPlainText(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `<html><body><h1>Title</h1><p>Hello fetch tool</p></body></html>`)
 	}))
 	defer srv.Close()
 
-	tool := tools.NewFetchTool(tools.NewGate(tools.DefaultGateOptions()), srv.Client())
+	tool := tools.NewFetchWebTool(tools.NewGate(tools.DefaultGateOptions()), srv.Client())
 	res, err := tool.Invoke(context.Background(), mustJSON(t, map[string]any{"url": srv.URL}))
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	if !strings.Contains(res.Payload, "Hello fetch tool") {
 		t.Fatalf("payload = %q", res.Payload)
+	}
+}
+
+func TestFetchRawToolReturnsExactTextBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "# Heading\n\nliteral body")
+	}))
+	defer srv.Close()
+
+	tool := tools.NewFetchRawTool(tools.NewGate(tools.DefaultGateOptions()), srv.Client())
+	res, err := tool.Invoke(context.Background(), mustJSON(t, map[string]any{"url": srv.URL}))
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !strings.Contains(res.Payload, "# Heading") || !strings.Contains(res.Payload, "literal body") {
+		t.Fatalf("payload = %q", res.Payload)
+	}
+}
+
+func TestFetchJSONToolPrettyPrintsJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"toon","items":[1,2]}`)
+	}))
+	defer srv.Close()
+
+	tool := tools.NewFetchJSONTool(tools.NewGate(tools.DefaultGateOptions()), srv.Client())
+	res, err := tool.Invoke(context.Background(), mustJSON(t, map[string]any{"url": srv.URL}))
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !strings.Contains(res.Payload, `"name": "toon"`) || !strings.Contains(res.Payload, `"items": [`) {
+		t.Fatalf("payload = %q", res.Payload)
+	}
+}
+
+func TestCloneRepoToolClonesLocalRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+	runGit(source, "init")
+	runGit(source, "config", "user.email", "test@example.com")
+	runGit(source, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("hello repo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(source, "add", "README.md")
+	runGit(source, "commit", "-m", "init")
+
+	tool := tools.NewCloneRepoTool(tools.NewGate(tools.DefaultGateOptions()))
+	res, err := tool.Invoke(context.Background(), mustJSON(t, map[string]any{
+		"repo_url": source,
+		"path":     target,
+	}))
+	if err != nil {
+		t.Fatalf("Invoke: %v payload=%q", err, res.Payload)
+	}
+	if _, err := os.Stat(filepath.Join(target, "README.md")); err != nil {
+		t.Fatalf("expected cloned README.md: %v", err)
 	}
 }
 

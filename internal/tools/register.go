@@ -13,7 +13,10 @@ func NewDefaultRegistry() *Registry {
 	mustRegister(reg, NewWriteFileTool(gate))
 	mustRegister(reg, NewEditTool(gate))
 	mustRegister(reg, NewRunTool(gate))
-	mustRegister(reg, NewFetchTool(gate, http.DefaultClient))
+	mustRegister(reg, NewFetchWebTool(gate, http.DefaultClient))
+	mustRegister(reg, NewFetchRawTool(gate, http.DefaultClient))
+	mustRegister(reg, NewFetchJSONTool(gate, http.DefaultClient))
+	mustRegister(reg, NewCloneRepoTool(gate))
 
 	return reg
 }

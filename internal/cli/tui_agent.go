@@ -212,7 +212,7 @@ func (a *tuiAgent) CoderSubmit(ctx context.Context, prompt string) (tui.Reply, e
 	if a.deps.Coder == nil {
 		return tui.Reply{}, fmt.Errorf("coder mode is unavailable")
 	}
-	wf, err := a.deps.Coder.CreatePlan(ctx, a.deps.effectiveSessionID(), prompt)
+	wf, err := a.deps.Coder.CreatePlan(ctx, a.deps.effectiveSessionID(), ComposeCoderPrompt(prompt, a.messages))
 	if err != nil {
 		if latest, ok, loadErr := a.deps.Coder.LatestBySession(ctx, a.deps.effectiveSessionID()); loadErr == nil && ok {
 			a.workflow = &latest
@@ -243,6 +243,76 @@ func (a *tuiAgent) CoderSubmit(ctx context.Context, prompt string) (tui.Reply, e
 	}, nil
 }
 
+func ComposeCoderPrompt(prompt string, history []domain.Message) string {
+	prompt = sanitizeCoderPromptText(prompt)
+	if prompt == "" {
+		return ""
+	}
+	contextLines := coderContextLines(prompt, history)
+	if len(contextLines) == 0 {
+		return prompt
+	}
+	var b strings.Builder
+	b.WriteString("Current request:\n")
+	b.WriteString(prompt)
+	b.WriteString("\n\nPrior conversation context from this session:\n")
+	for _, line := range contextLines {
+		b.WriteString("- ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func coderContextLines(prompt string, history []domain.Message) []string {
+	prompt = sanitizeCoderPromptText(prompt)
+	if len(history) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, 6)
+	for i := len(history) - 1; i >= 0 && len(lines) < 6; i-- {
+		msg := history[i]
+		if msg.Role != domain.RoleUser && msg.Role != domain.RoleAssistant {
+			continue
+		}
+		text := sanitizeCoderPromptText(msg.Content)
+		if text == "" {
+			continue
+		}
+		if msg.Role == domain.RoleUser && text == prompt {
+			continue
+		}
+		label := "user"
+		if msg.Role == domain.RoleAssistant {
+			label = "assistant"
+		}
+		lines = append(lines, label+": "+compactCoderContext(text, 320))
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
+}
+
+func sanitizeCoderPromptText(text string) string {
+	text = strings.ReplaceAll(text, "\x00", "")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.TrimSpace(text)
+}
+
+func compactCoderContext(text string, limit int) string {
+	text = sanitizeCoderPromptText(text)
+	text = strings.Join(strings.Fields(text), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	if limit <= 3 {
+		return text[:limit]
+	}
+	return strings.TrimSpace(text[:limit-3]) + "..."
+}
+
 func (a *tuiAgent) CoderReview(ctx context.Context, feedback string) (tui.Reply, error) {
 	if a.workflow == nil {
 		return tui.Reply{}, fmt.Errorf("no active coder workflow")
@@ -271,7 +341,7 @@ func (a *tuiAgent) CoderApprove(ctx context.Context) (tui.Reply, error) {
 	}
 	a.workflow = &wf
 	return tui.Reply{
-		Text:     renderWorkflowChatSummary(wf, "Plan approved. The workflow is ready for execution."),
+		Text:     renderWorkflowChatSummary(wf, "Plan approved. Starting execution."),
 		Budget:   a.withSessionTokens(a.coderBudget(ctx, wf)),
 		Stats:    wfSummary(wf),
 		Mode:     a.mode,
@@ -344,6 +414,25 @@ func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Rep
 	}, nil
 }
 
+func (a *tuiAgent) LiveStatus(ctx context.Context) (tui.Reply, error) {
+	reply := tui.Reply{
+		Mode:     a.mode,
+		Workflow: a.CoderWorkflow(),
+	}
+	if a.workflow != nil {
+		reply.Budget = a.withSessionTokens(a.coderBudget(ctx, *a.workflow))
+		reply.Stats = wfSummary(*a.workflow)
+	} else {
+		reply.Budget = a.withSessionTokens(tui.BudgetSnapshot{})
+	}
+	if a.deps.Telemetry != nil {
+		if totals, err := a.deps.Telemetry.Totals(ctx, a.deps.effectiveSessionID()); err == nil {
+			reply.Stats = telemetry.FormatTotals(totals)
+		}
+	}
+	return reply, nil
+}
+
 func wfSummary(wf domain.CoderWorkflow) string {
 	done := 0
 	for _, task := range wf.Tasks {
@@ -390,9 +479,7 @@ func renderWorkflowExecutionSummary(wf domain.CoderWorkflow, intro string) strin
 	b.WriteString("  user:\n")
 	b.WriteString(indentBlock(strings.TrimSpace(wf.UserPrompt), "    "))
 	b.WriteString("\n")
-	b.WriteString("  enriched:\n")
-	b.WriteString(indentBlock(firstNonEmpty(strings.TrimSpace(wf.EnrichedPrompt), "(not enriched)"), "    "))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 	b.WriteString("## Tasks Performed\n\n")
 	b.WriteString("  ")
 	b.WriteString(agentRunChain(wf))
@@ -465,8 +552,6 @@ func workflowDuration(wf domain.CoderWorkflow) string {
 
 func colorAgent(agent domain.WorkflowAgent) string {
 	switch agent {
-	case domain.WorkflowAgentOrchestrator:
-		return "`orchestrator`"
 	case domain.WorkflowAgentPlanner:
 		return "`planner`"
 	case domain.WorkflowAgentArchitecture:
@@ -542,7 +627,8 @@ func budgetSnapshot(r agent.BudgetReport) tui.BudgetSnapshot {
 
 func (a *tuiAgent) withSessionTokens(b tui.BudgetSnapshot) tui.BudgetSnapshot {
 	if a.deps != nil {
-		b.SessionTokens = a.deps.SessionTotalTokens
+		b.SessionTokens = a.deps.currentSessionTokens()
+		b.SessionTracked = true
 	}
 	return b
 }

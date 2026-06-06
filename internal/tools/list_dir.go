@@ -25,7 +25,7 @@ func NewListDirTool(gate Gate) Tool {
 func (t *ListDirTool) Name() string { return "list_dir" }
 
 func (t *ListDirTool) Description() string {
-	return "List a directory with heavy folders collapsed and entry count capped."
+	return "List local directory entries only. Use this to inspect folder structure before reading or editing files."
 }
 
 func (t *ListDirTool) Schema() json.RawMessage {

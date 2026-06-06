@@ -37,6 +37,7 @@ type Agent interface {
 	CoderExecute(ctx context.Context) (Reply, error)
 	CoderExecuteStream(ctx context.Context, onUpdate func(Reply)) (Reply, error)
 	CoderWorkflow() *domain.CoderWorkflow
+	LiveStatus(ctx context.Context) (Reply, error)
 }
 
 // Reply is one agent response rendered into the TUI.
@@ -66,6 +67,7 @@ type BudgetSnapshot struct {
 	PromptLimit    int
 	OutputHeadroom int
 	SessionTokens  int
+	SessionTracked bool
 	Pools          []PoolSnapshot
 }
 
@@ -233,7 +235,7 @@ func renderBudgetMeter(b BudgetSnapshot, width int, verbose bool) string {
 }
 
 func renderBudgetCompact(b BudgetSnapshot) string {
-	if b.SessionTokens > 0 {
+	if b.SessionTracked {
 		return fmt.Sprintf("tok %d", b.SessionTokens)
 	}
 	return fmt.Sprintf("tok %d", b.PromptTokens)

@@ -26,7 +26,7 @@ func NewRunTool(gate Gate) Tool {
 func (t *RunTool) Name() string { return "run" }
 
 func (t *RunTool) Description() string {
-	return "Run a shell command and return compact stdout, stderr, and exit code."
+	return "Run a real local shell command. Best for git, node, tests, and other CLI tasks that are awkward with higher-level tools."
 }
 
 func (t *RunTool) Schema() json.RawMessage {

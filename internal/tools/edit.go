@@ -29,7 +29,7 @@ func NewEditTool(gate Gate) Tool {
 func (t *EditTool) Name() string { return "edit" }
 
 func (t *EditTool) Description() string {
-	return "Apply compact anchor patches atomically, with rollback and compact verification failures."
+	return "Patch existing local files atomically, with rollback if verification commands fail."
 }
 
 func (t *EditTool) Schema() json.RawMessage {

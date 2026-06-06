@@ -37,7 +37,6 @@ const (
 type WorkflowAgent string
 
 const (
-	WorkflowAgentOrchestrator WorkflowAgent = "orchestrator"
 	WorkflowAgentPlanner      WorkflowAgent = "planner"
 	WorkflowAgentArchitecture WorkflowAgent = "architecture"
 	WorkflowAgentSolutioner   WorkflowAgent = "solutioner"
@@ -62,8 +61,6 @@ type CoderWorkflow struct {
 	Mode                string             `json:"mode"`
 	UserPrompt          string             `json:"user_prompt"`
 	Stages              WorkflowStages     `json:"stages"`
-	EnrichedPrompt      string             `json:"enriched_prompt,omitempty"`
-	PlannerInstructions string             `json:"planner_instructions,omitempty"`
 	ExecutionSummary    string             `json:"execution_summary,omitempty"`
 	PlanVersion         int                `json:"plan_version"`
 	State               WorkflowState      `json:"state"`
@@ -78,7 +75,6 @@ type CoderWorkflow struct {
 }
 
 type WorkflowStages struct {
-	Orchestrator WorkflowStage `json:"orchestrator"`
 	Planner      WorkflowStage `json:"planner"`
 }
 

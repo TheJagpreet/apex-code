@@ -30,7 +30,7 @@ func NewGrepTool(gate Gate) Tool {
 func (t *GrepTool) Name() string { return "grep" }
 
 func (t *GrepTool) Description() string {
-	return "Search files with ranked, capped matches and compact context."
+	return "Search local files for matching text with compact context. Best for locating symbols, strings, and TODOs."
 }
 
 func (t *GrepTool) Schema() json.RawMessage {

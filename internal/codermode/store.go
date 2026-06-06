@@ -197,6 +197,7 @@ func ValidateWorkflow(wf domain.CoderWorkflow) error {
 
 func NewWorkflow(sessionID, prompt string) domain.CoderWorkflow {
 	now := time.Now().UTC()
+	prompt = sanitizeWorkflowText(prompt)
 	return domain.CoderWorkflow{
 		SchemaVersion: 1,
 		ID:            workflowID(),
@@ -204,13 +205,9 @@ func NewWorkflow(sessionID, prompt string) domain.CoderWorkflow {
 		Mode:          "coder",
 		UserPrompt:    strings.TrimSpace(prompt),
 		Stages: domain.WorkflowStages{
-			Orchestrator: domain.WorkflowStage{
-				Status:    "pending",
-				Input:     strings.TrimSpace(prompt),
-				UpdatedAt: now,
-			},
 			Planner: domain.WorkflowStage{
 				Status:    "pending",
+				Input:     prompt,
 				UpdatedAt: now,
 			},
 		},
@@ -219,6 +216,12 @@ func NewWorkflow(sessionID, prompt string) domain.CoderWorkflow {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+}
+
+func sanitizeWorkflowText(text string) string {
+	text = strings.ReplaceAll(text, "\x00", "")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.TrimSpace(text)
 }
 
 func sanitizeFilePart(v string) string {
