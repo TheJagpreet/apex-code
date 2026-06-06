@@ -2,12 +2,14 @@ package telemetry_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/apex-code/apex/internal/domain"
 	"github.com/apex-code/apex/internal/telemetry"
 )
 
@@ -141,7 +143,23 @@ func TestSessionFileStoreAppendsStructuredTelemetry(t *testing.T) {
 		CompletionTokens: 5,
 		TotalTokens:      15,
 		ToolCalls:        []string{"read_file"},
-		ToolResults:      1,
+		ToolCallDetails: []domain.ToolCall{
+			{ID: "call_1", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`)},
+		},
+		ToolResults: 1,
+		ToolResultDetails: []domain.ToolResult{
+			{ToolCallID: "call_1", Content: "README contents"},
+		},
+		InputMessages: []domain.Message{
+			{Role: domain.RoleUser, Content: "Read the README"},
+		},
+		OutputMessage: &domain.Message{
+			Role:    domain.RoleAssistant,
+			Content: "",
+			ToolCalls: []domain.ToolCall{
+				{ID: "call_1", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`)},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("append event 1: %v", err)
@@ -174,10 +192,97 @@ func TestSessionFileStoreAppendsStructuredTelemetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read telemetry file: %v", err)
 	}
-	if !strings.Contains(string(data), `"session_id": "sess-1"`) || !strings.Contains(string(data), `"workflow_id": "wf-1"`) {
+	if !strings.Contains(string(data), `"session_id": "sess-1"`) ||
+		!strings.Contains(string(data), `"workflow_id": "wf-1"`) ||
+		!strings.Contains(string(data), `"tool_call_details"`) ||
+		!strings.Contains(string(data), `"input_messages"`) ||
+		!strings.Contains(string(data), `"output_message"`) ||
+		!strings.Contains(string(data), `"path": "README.md"`) {
 		t.Fatalf("telemetry file missing expected fields: %s", string(data))
 	}
 	if filepath.Base(filepath.Dir(path)) != "sess-1" {
 		t.Fatalf("telemetry path should live in session dir, got %s", path)
+	}
+}
+
+func TestToolExecOutcomeClassifiesRecoverableErrors(t *testing.T) {
+	outcome, recoverable := telemetry.ToolExecOutcome([]domain.ToolResult{
+		{
+			ToolCallID: "call_1",
+			Content:    "tool error: file too large for full read; provide start_line and end_line",
+			IsError:    true,
+		},
+	})
+	if outcome != "recoverable_error" || !recoverable {
+		t.Fatalf("expected recoverable tool error, got outcome=%q recoverable=%v", outcome, recoverable)
+	}
+
+	outcome, recoverable = telemetry.ToolExecOutcome([]domain.ToolResult{
+		{
+			ToolCallID: "call_2",
+			Content:    "tool error: permission denied",
+			IsError:    true,
+		},
+	})
+	if outcome != "error" || recoverable {
+		t.Fatalf("expected terminal tool error, got outcome=%q recoverable=%v", outcome, recoverable)
+	}
+
+	outcome, recoverable = telemetry.ToolExecOutcome([]domain.ToolResult{
+		{
+			ToolCallID: "call_3",
+			Content:    "ok",
+		},
+	})
+	if outcome != "success" || recoverable {
+		t.Fatalf("expected success, got outcome=%q recoverable=%v", outcome, recoverable)
+	}
+}
+
+func TestTelemetryRollupsIgnoreNonLLMEvents(t *testing.T) {
+	root := t.TempDir()
+	files, err := telemetry.OpenFileStore(filepath.Join(root, "sessions"))
+	if err != nil {
+		t.Fatalf("open file store: %v", err)
+	}
+	ctx := context.Background()
+	if err := files.AppendEvent(ctx, "sess-1", telemetry.FileMeta{Model: "deepseek-v4-flash"}, telemetry.SessionEvent{
+		Index:            1,
+		Timestamp:        time.Unix(1000, 0).UTC(),
+		Kind:             "llm_turn",
+		Model:            "deepseek-v4-flash",
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		TotalTokens:      15,
+	}); err != nil {
+		t.Fatalf("append llm event: %v", err)
+	}
+	if err := files.AppendEvent(ctx, "sess-1", telemetry.FileMeta{}, telemetry.SessionEvent{
+		Index:       2,
+		Timestamp:   time.Unix(1001, 0).UTC(),
+		Kind:        "tool_exec",
+		ToolCalls:   []string{"list_dir"},
+		ToolResults: 1,
+	}); err != nil {
+		t.Fatalf("append tool event: %v", err)
+	}
+	store, err := telemetry.Open(root)
+	if err != nil {
+		t.Fatalf("open telemetry store: %v", err)
+	}
+	defer store.Close()
+	totals, err := store.Totals(ctx, "sess-1")
+	if err != nil {
+		t.Fatalf("totals: %v", err)
+	}
+	if totals.Turns != 1 || totals.TotalTokens != 15 {
+		t.Fatalf("totals should ignore non-llm events: %+v", totals)
+	}
+	recent, err := store.Recent(ctx, "sess-1", 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(recent) != 1 || recent[0].TotalTokens != 15 {
+		t.Fatalf("recent should ignore non-llm events: %+v", recent)
 	}
 }

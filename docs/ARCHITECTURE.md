@@ -210,6 +210,9 @@ curated state rather than replaying every raw turn.
 ### `internal/telemetry`
 
 Stores append-only, file-backed session telemetry and powers `apex stats`.
+Each session event can carry the exact provider-bound `input_messages`, the raw
+assistant `output_message`, structured tool-call details including arguments,
+tool-result payloads, and provider-reported token usage.
 
 ### `internal/repoindex`
 
@@ -377,10 +380,18 @@ Telemetry records:
 - prompt / completion / total tokens
 - cache creation / cache read tokens when available
 - per-turn latency
+- exact request messages sent to the provider
+- exact assistant output returned by the provider
+- tool call details including ids, names, and raw arguments
+- tool result payloads
 - model rollups
 - session rollups
 - savings attributed to lazy tools or compaction
 - workflow/task/agent context for coder-mode turns
+
+For the OpenAI-compatible adapter, token usage is taken from the provider's
+reported `usage` fields on the completion response stream, not from local token
+estimation.
 - tool-call names and tool-result counts
 
 The TUI status bar token counter is a session-level running total rather than a

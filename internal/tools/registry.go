@@ -130,8 +130,6 @@ func renderToolResult(res Result) string {
 	b.WriteString(res.ToolName)
 	b.WriteString("\nsummary: ")
 	b.WriteString(res.Summary)
-	b.WriteString("\ntokens: ")
-	b.WriteString(fmt.Sprintf("%d", res.TokenCost))
 	if res.Truncated {
 		b.WriteString("\ntruncated: true")
 	}

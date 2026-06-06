@@ -49,17 +49,7 @@ func (a *tuiAgent) SessionLabel() string {
 	if a.deps.SessionID == "" {
 		return "new"
 	}
-	if a.deps.Sessions == nil {
-		return a.deps.SessionID
-	}
-	record, _, _, err := a.deps.Sessions.Load(a.ctx, a.deps.SessionID)
-	if err != nil {
-		return a.deps.SessionID
-	}
-	if record.Title != "" {
-		return record.Title
-	}
-	return record.ID
+	return a.deps.SessionID
 }
 
 func (a *tuiAgent) LazyTools() bool { return a.deps.cfg.LazyTools }

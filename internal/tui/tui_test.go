@@ -214,15 +214,26 @@ func TestModeSuggestionsShowConcreteModes(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("mode suggestions wrong: %+v", got)
 	}
-	if got[0].Label != "/mode chat" || got[1].Label != "/mode coder" {
+	if got[0].Label != "/chat" || got[1].Label != "/coder" {
 		t.Fatalf("unexpected mode suggestion labels: %+v", got)
 	}
 }
 
 func TestModeSuggestionsPrioritizeMatchingPartialMode(t *testing.T) {
 	got := modeSuggestions("/mode cod")
-	if len(got) != 1 || got[0].Label != "/mode coder" {
+	if len(got) != 1 || got[0].Label != "/coder" {
 		t.Fatalf("mode suggestions should prioritize coder for partial cod: %+v", got)
+	}
+}
+
+func TestDirectModeSuggestions(t *testing.T) {
+	got := modeSuggestions("/co")
+	if len(got) != 1 || got[0].Label != "/coder" {
+		t.Fatalf("direct coder suggestion wrong: %+v", got)
+	}
+	got = modeSuggestions("/ch")
+	if len(got) != 1 || got[0].Label != "/chat" {
+		t.Fatalf("direct chat suggestion wrong: %+v", got)
 	}
 }
 
@@ -266,7 +277,7 @@ func TestCoderModeCommandsDriveWorkflow(t *testing.T) {
 	m := New(context.Background(), agent, false)
 
 	var err error
-	m, _, err = m.command("/mode coder")
+	m, _, err = m.command("/coder")
 	if err != nil {
 		t.Fatalf("mode: %v", err)
 	}
@@ -293,6 +304,28 @@ func TestCoderModeCommandsDriveWorkflow(t *testing.T) {
 	next = gotApprove.(Model)
 	if next.workflow == nil || next.workflow.State != domain.WorkflowStateCompleted {
 		t.Fatalf("workflow state = %+v", next.workflow)
+	}
+}
+
+func TestDirectChatCommandSwitchesMode(t *testing.T) {
+	agent := &stubAgent{model: "gemma4:e2b", cwd: ".", session: "new", mode: "coder"}
+	m := New(context.Background(), agent, false)
+	var err error
+	m, _, err = m.command("/chat")
+	if err != nil {
+		t.Fatalf("chat mode: %v", err)
+	}
+	if agent.Mode() != "chat" {
+		t.Fatalf("mode = %q", agent.Mode())
+	}
+}
+
+func TestCompactSessionLabel(t *testing.T) {
+	if got := compactSessionLabel("1234567890abcdef"); got != "12345678..." {
+		t.Fatalf("compact session label = %q", got)
+	}
+	if got := compactSessionLabel("new"); got != "new" {
+		t.Fatalf("compact short label = %q", got)
 	}
 }
 
@@ -361,7 +394,7 @@ func TestWelcomeBannerKeepsIndentedFirstLine(t *testing.T) {
 
 func TestComposerWidthFitsInnerFrame(t *testing.T) {
 	width := innerWidthFromFrame(72)
-	out := renderComposer("hi", nil, 0, PaneChat, width, false, "", false)
+	out := renderComposer("hi", 2, nil, 0, PaneChat, width, false, "", false)
 	lines := strings.Split(out, "\n")
 	if len(lines) < 3 {
 		t.Fatalf("composer output too short: %q", out)
@@ -373,7 +406,7 @@ func TestComposerWidthFitsInnerFrame(t *testing.T) {
 }
 
 func TestComposerHelpUsesAltShortcuts(t *testing.T) {
-	out := renderComposer("hi", nil, 0, PaneChat, 40, false, "", false)
+	out := renderComposer("hi", 2, nil, 0, PaneChat, 40, false, "", false)
 	if !strings.Contains(out, "[alt+p] companion") || !strings.Contains(out, "[alt+t] theme") {
 		t.Fatalf("composer help missing alt shortcuts: %q", out)
 	}
@@ -450,7 +483,7 @@ func TestEnterAcceptsModeSuggestionFromPartialArgument(t *testing.T) {
 		t.Fatal("accepting a mode suggestion should not submit immediately")
 	}
 	got := next.(Model)
-	if got.input != "/mode chat" {
+	if got.input != "/chat" {
 		t.Fatalf("input = %q", got.input)
 	}
 }
@@ -466,6 +499,40 @@ func TestEnterSubmitsExactSlashCommand(t *testing.T) {
 	got := next.(Model)
 	if len(got.transcript) == 0 || got.transcript[len(got.transcript)-1].Title != "Sessions" {
 		t.Fatalf("transcript = %+v", got.transcript)
+	}
+}
+
+func TestArrowKeysMoveComposerCursorAndInsertInPlace(t *testing.T) {
+	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
+	m.input = "helo"
+	m.inputCursor = len([]rune(m.input))
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyLeft})
+	got := next.(Model)
+	next, _ = got.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	got = next.(Model)
+
+	if got.input != "hello" {
+		t.Fatalf("input = %q", got.input)
+	}
+	if got.inputCursor != 4 {
+		t.Fatalf("cursor = %d", got.inputCursor)
+	}
+}
+
+func TestBackspaceRemovesRuneBeforeComposerCursor(t *testing.T) {
+	m := New(context.Background(), &stubAgent{model: "gemma4:e2b", cwd: "."}, false)
+	m.input = "abdc"
+	m.inputCursor = 3
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	got := next.(Model)
+
+	if got.input != "abc" {
+		t.Fatalf("input = %q", got.input)
+	}
+	if got.inputCursor != 2 {
+		t.Fatalf("cursor = %d", got.inputCursor)
 	}
 }
 

@@ -50,14 +50,14 @@ func (p Pane) String() string {
 }
 
 type runtimeStatus struct {
-	Model     string
-	CWD       string
-	Session   string
-	Companion string
-	Theme     string
+	Model          string
+	CWD            string
+	Session        string
+	Companion      string
+	Theme          string
 	ContextSummary string
-	LazyTools bool
-	Mode      string
+	LazyTools      bool
+	Mode           string
 }
 
 // replyMsg carries an agent reply back into the Bubble Tea update loop.
@@ -94,6 +94,7 @@ type Model struct {
 	agent Agent
 
 	input           string
+	inputCursor     int
 	history         []string
 	historyIndex    int
 	transcript      []transcriptEntry
@@ -256,7 +257,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "shift+enter" {
-		m.input += "\n"
+		m.insertInput("\n")
 		m.updateSuggestions()
 		return m, nil
 	}
@@ -290,6 +291,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyCtrlU:
 		m.input = ""
+		m.inputCursor = 0
 		m.clearSuggestions()
 		return m, nil
 	case tea.KeyCtrlO:
@@ -323,9 +325,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m.submit()
 	case tea.KeyBackspace:
-		if n := len(m.input); n > 0 {
-			m.input = m.input[:n-1]
-		}
+		m.backspaceInput()
+		m.updateSuggestions()
+		return m, nil
+	case tea.KeyDelete:
+		m.deleteInput()
+		m.updateSuggestions()
+		return m, nil
+	case tea.KeyLeft:
+		m.moveInputCursor(-1)
+		return m, nil
+	case tea.KeyRight:
+		m.moveInputCursor(1)
+		return m, nil
+	case tea.KeyCtrlA:
+		m.inputCursor = 0
+		return m, nil
+	case tea.KeyCtrlE:
+		m.inputCursor = len([]rune(m.input))
 		m.updateSuggestions()
 		return m, nil
 	case tea.KeyUp:
@@ -361,13 +378,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollBy(-m.pageStep())
 		return m, nil
 	case tea.KeyHome:
+		if m.input != "" {
+			m.inputCursor = 0
+			return m, nil
+		}
 		m.scrollToTop()
 		return m, nil
 	case tea.KeyEnd:
+		if m.input != "" {
+			m.inputCursor = len([]rune(m.input))
+			return m, nil
+		}
 		m.scrollToBottom()
 		return m, nil
 	case tea.KeyRunes, tea.KeySpace:
-		m.input += string(msg.Runes)
+		m.insertInput(string(msg.Runes))
 		m.updateSuggestions()
 		return m, nil
 	}
@@ -388,10 +413,68 @@ func (m *Model) recallHistory(delta int) {
 	if m.historyIndex >= len(m.history) {
 		m.historyIndex = len(m.history)
 		m.input = ""
+		m.inputCursor = 0
 		return
 	}
 	m.input = m.history[m.historyIndex]
+	m.inputCursor = len([]rune(m.input))
 	m.updateSuggestions()
+}
+
+func (m *Model) insertInput(text string) {
+	if text == "" {
+		return
+	}
+	runes := []rune(m.input)
+	m.clampInputCursor(len(runes))
+	insert := []rune(text)
+	next := make([]rune, 0, len(runes)+len(insert))
+	next = append(next, runes[:m.inputCursor]...)
+	next = append(next, insert...)
+	next = append(next, runes[m.inputCursor:]...)
+	m.input = string(next)
+	m.inputCursor += len(insert)
+}
+
+func (m *Model) backspaceInput() {
+	runes := []rune(m.input)
+	m.clampInputCursor(len(runes))
+	if m.inputCursor <= 0 || len(runes) == 0 {
+		return
+	}
+	next := make([]rune, 0, len(runes)-1)
+	next = append(next, runes[:m.inputCursor-1]...)
+	next = append(next, runes[m.inputCursor:]...)
+	m.input = string(next)
+	m.inputCursor--
+}
+
+func (m *Model) deleteInput() {
+	runes := []rune(m.input)
+	m.clampInputCursor(len(runes))
+	if m.inputCursor >= len(runes) || len(runes) == 0 {
+		return
+	}
+	next := make([]rune, 0, len(runes)-1)
+	next = append(next, runes[:m.inputCursor]...)
+	next = append(next, runes[m.inputCursor+1:]...)
+	m.input = string(next)
+}
+
+func (m *Model) moveInputCursor(delta int) {
+	runes := []rune(m.input)
+	m.clampInputCursor(len(runes))
+	m.inputCursor += delta
+	m.clampInputCursor(len(runes))
+}
+
+func (m *Model) clampInputCursor(length int) {
+	if m.inputCursor < 0 {
+		m.inputCursor = 0
+	}
+	if m.inputCursor > length {
+		m.inputCursor = length
+	}
 }
 
 func (m Model) submit() (tea.Model, tea.Cmd) {
@@ -402,6 +485,7 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 	m.history = append(m.history, prompt)
 	m.historyIndex = len(m.history)
 	m.input = ""
+	m.inputCursor = 0
 	m.clearSuggestions()
 
 	if strings.HasPrefix(prompt, "/") {
@@ -553,6 +637,19 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		})
 		m.selectLatestEntry()
 		m.scrollToBottom()
+	case "/chat", "/coder":
+		mode := strings.TrimPrefix(fields[0], "/")
+		if err := m.agent.SetMode(m.ctx, mode); err != nil {
+			return m, nil, err
+		}
+		m.workflow = m.agent.CoderWorkflow()
+		m.transcript = append(m.transcript, transcriptEntry{
+			Kind:  entryStatus,
+			Title: "Mode switched",
+			Body:  "Active mode is now " + m.agent.Mode(),
+		})
+		m.selectLatestEntry()
+		m.scrollToBottom()
 	case "/mode":
 		if len(fields) == 1 {
 			m.transcript = append(m.transcript, transcriptEntry{
@@ -617,6 +714,7 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		m.diffs = nil
 		m.recentRefs = nil
 		m.input = ""
+		m.inputCursor = 0
 		m.clearSuggestions()
 		m.lastErr = nil
 		m.pane = PaneChat
@@ -652,6 +750,7 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 			return m, nil, fmt.Errorf("unknown prompt starter %q", fields[0])
 		}
 		m.input = prompt.Body
+		m.inputCursor = len([]rune(m.input))
 		m.updateSuggestions()
 	case "/verbose":
 		m.verbose = !m.verbose
@@ -728,6 +827,7 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 				lines = append(lines, fmt.Sprintf("%s  %s  %s", session.ID, session.Model, session.Title))
 			}
 			m.input = "/resume "
+			m.inputCursor = len([]rune(m.input))
 			m.transcript = append(m.transcript, transcriptEntry{
 				Kind:  entryStatus,
 				Title: "Resume session",
@@ -822,14 +922,14 @@ func (m Model) View() string {
 		return "bye\n"
 	}
 	status := runtimeStatus{
-		Model:     m.agent.Model(),
-		CWD:       filepath.Base(m.agent.CWD()),
-		Session:   m.agent.SessionLabel(),
-		Companion: m.pet.currentPersona().Name,
-		Theme:     themeName(m.themeIndex),
+		Model:          m.agent.Model(),
+		CWD:            filepath.Base(m.agent.CWD()),
+		Session:        m.agent.SessionLabel(),
+		Companion:      m.pet.currentPersona().Name,
+		Theme:          themeName(m.themeIndex),
 		ContextSummary: renderBudgetCompact(m.budget),
-		LazyTools: m.agent.LazyTools(),
-		Mode:      m.agent.Mode(),
+		LazyTools:      m.agent.LazyTools(),
+		Mode:           m.agent.Mode(),
 	}
 	inner := m.frameInnerWidth()
 	header := wrapTo(m.headerView(status), inner)
@@ -971,7 +1071,7 @@ func (m Model) renderChrome(status runtimeStatus) string {
 	if hasSection {
 		b.WriteString("\n\n")
 	}
-	b.WriteString(renderComposer(m.input, m.suggestions, m.suggestionIndex, m.pane, innerWidthFromFrame(m.width), m.verbose, m.copyStatus, m.working))
+	b.WriteString(renderComposer(m.input, m.inputCursor, m.suggestions, m.suggestionIndex, m.pane, innerWidthFromFrame(m.width), m.verbose, m.copyStatus, m.working))
 	if footer := renderStatusFooter(status, m.pane); strings.TrimSpace(footer) != "" {
 		b.WriteString("\n")
 		b.WriteString(footer)
@@ -1091,6 +1191,7 @@ func (m *Model) acceptSuggestion() {
 	} else {
 		m.input += s.Insert
 	}
+	m.inputCursor = len([]rune(m.input))
 	m.clearSuggestions()
 }
 
@@ -1127,14 +1228,14 @@ func (m *Model) conversationHeight(header, chrome string) int {
 // does. It mirrors View's layout exactly.
 func (m *Model) scrollMetrics() (total, height int) {
 	status := runtimeStatus{
-		Model:     m.agent.Model(),
-		CWD:       filepath.Base(m.agent.CWD()),
-		Session:   m.agent.SessionLabel(),
-		Companion: m.pet.currentPersona().Name,
-		Theme:     themeName(m.themeIndex),
+		Model:          m.agent.Model(),
+		CWD:            filepath.Base(m.agent.CWD()),
+		Session:        m.agent.SessionLabel(),
+		Companion:      m.pet.currentPersona().Name,
+		Theme:          themeName(m.themeIndex),
 		ContextSummary: renderBudgetCompact(m.budget),
-		LazyTools: m.agent.LazyTools(),
-		Mode:      m.agent.Mode(),
+		LazyTools:      m.agent.LazyTools(),
+		Mode:           m.agent.Mode(),
 	}
 	inner := m.frameInnerWidth()
 	height = m.conversationHeight(wrapTo(m.headerView(status), inner), wrapTo(m.renderChrome(status), inner))
@@ -1237,24 +1338,58 @@ func commandSuggestions(token string) []suggestion {
 
 func modeSuggestions(input string) []suggestion {
 	trimmed := strings.TrimSpace(strings.ToLower(input))
-	if trimmed == "" || !strings.HasPrefix(trimmed, "/mode") {
+	if trimmed == "/chat" || trimmed == "/coder" {
 		return nil
 	}
-	if strings.HasPrefix(trimmed, "/mode chat") || strings.HasPrefix(trimmed, "/mode coder") {
+	if trimmed == "" {
 		return nil
 	}
-	query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/mode"))
+	isDirectModePrefix := strings.HasPrefix("/chat", trimmed) || strings.HasPrefix("/coder", trimmed)
+	if !strings.HasPrefix(trimmed, "/mode") && !isDirectModePrefix {
+		return nil
+	}
 	options := []suggestion{
-		{Label: "/mode chat", Insert: "/mode chat", Detail: "switch to normal chat mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
-		{Label: "/mode coder", Insert: "/mode coder", Detail: "switch to coder workflow mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
+		{Label: "/chat", Insert: "/chat", Detail: "switch to normal chat mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
+		{Label: "/coder", Insert: "/coder", Detail: "switch to coder workflow mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
 	}
-	if query == "" {
+	if trimmed == "/mode" || strings.HasPrefix(trimmed, "/mode ") {
+		if strings.HasPrefix(trimmed, "/mode chat") || strings.HasPrefix(trimmed, "/mode coder") {
+			return nil
+		}
+		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/mode"))
+		if query == "" {
+			return options
+		}
+		var ranked []suggestion
+		for _, option := range options {
+			mode := strings.TrimPrefix(strings.ToLower(option.Label), "/")
+			if strings.HasPrefix(mode, query) {
+				ranked = append(ranked, option)
+			}
+		}
+		if len(ranked) > 0 {
+			return ranked
+		}
+		for _, option := range options {
+			mode := strings.TrimPrefix(strings.ToLower(option.Label), "/")
+			if strings.Contains(mode, query) {
+				ranked = append(ranked, option)
+			}
+		}
+		return ranked
+	}
+	if trimmed == "/ch" || trimmed == "/cha" || trimmed == "/chat" || strings.HasPrefix("/chat", trimmed) {
+		return []suggestion{options[0]}
+	}
+	if trimmed == "/co" || trimmed == "/cod" || trimmed == "/code" || trimmed == "/coder" || strings.HasPrefix("/coder", trimmed) {
+		return []suggestion{options[1]}
+	}
+	if trimmed == "/" {
 		return options
 	}
 	var ranked []suggestion
 	for _, option := range options {
-		mode := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(option.Label), "/mode"))
-		if strings.HasPrefix(mode, query) {
+		if strings.HasPrefix(strings.ToLower(option.Label), trimmed) {
 			ranked = append(ranked, option)
 		}
 	}
@@ -1262,8 +1397,7 @@ func modeSuggestions(input string) []suggestion {
 		return ranked
 	}
 	for _, option := range options {
-		mode := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(option.Label), "/mode"))
-		if strings.Contains(mode, query) {
+		if strings.Contains(strings.ToLower(option.Label), trimmed) {
 			ranked = append(ranked, option)
 		}
 	}

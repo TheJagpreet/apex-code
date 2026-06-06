@@ -108,6 +108,9 @@ func (s *Store) queryMetrics(_ context.Context, sessionID string) ([]TurnMetric,
 	out := make([]TurnMetric, 0)
 	for _, doc := range artifacts {
 		for _, event := range doc.Events {
+			if !isLLMEventKind(event.Kind) {
+				continue
+			}
 			out = append(out, TurnMetric{
 				SessionID:        doc.SessionID,
 				TurnIndex:        event.Index,
@@ -131,6 +134,15 @@ func (s *Store) queryMetrics(_ context.Context, sessionID string) ([]TurnMetric,
 		return out[i].CreatedAt < out[j].CreatedAt
 	})
 	return out, nil
+}
+
+func isLLMEventKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "llm_turn", "stage_llm", "task_llm_turn":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) readArtifacts(sessionID string) ([]SessionArtifact, error) {

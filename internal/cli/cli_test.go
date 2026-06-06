@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/apex-code/apex/internal/agent"
 	"github.com/apex-code/apex/internal/domain"
+	"github.com/apex-code/apex/internal/telemetry"
 )
 
 func TestPickMode(t *testing.T) {
@@ -102,5 +104,42 @@ func TestShouldRetryWithToolNudge(t *testing.T) {
 	state.Turns[0].ToolCalls = []domain.ToolCall{{Name: "read_file"}}
 	if shouldRetryWithToolNudge(messages, state) {
 		t.Fatal("should not nudge when tools were already used")
+	}
+}
+
+func TestAppendSessionEventDoesNotWriteDuplicateLegacyRows(t *testing.T) {
+	root := t.TempDir()
+	files, err := telemetry.OpenFileStore(filepath.Join(root, "sessions"))
+	if err != nil {
+		t.Fatalf("open file store: %v", err)
+	}
+	store, err := telemetry.Open(root)
+	if err != nil {
+		t.Fatalf("open telemetry store: %v", err)
+	}
+	deps := &Deps{
+		Telemetry:      store,
+		TelemetryFiles: files,
+		cfg: Config{
+			Model: "deepseek-v4-flash",
+			CWD:   root,
+		},
+		SessionID: "sess-1",
+	}
+	if err := deps.appendSessionEvent(context.Background(), telemetry.SessionEvent{
+		Mode:             "coder",
+		Kind:             "stage_llm",
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		TotalTokens:      15,
+	}); err != nil {
+		t.Fatalf("append session event: %v", err)
+	}
+	totals, count, err := files.SessionTotals(context.Background(), "sess-1")
+	if err != nil {
+		t.Fatalf("session totals: %v", err)
+	}
+	if count != 1 || totals.TotalTokens != 15 {
+		t.Fatalf("unexpected telemetry file totals: count=%d totals=%+v", count, totals)
 	}
 }

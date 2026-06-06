@@ -15,21 +15,21 @@ import (
 )
 
 type ProgressEvent struct {
-	Kind     string
-	Agent    domain.WorkflowAgent
-	TaskID   string
+	Kind      string
+	Agent     domain.WorkflowAgent
+	TaskID    string
 	TaskTitle string
-	Summary  string
-	Error    string
-	Budget   agent.BudgetReport
-	Workflow domain.CoderWorkflow
+	Summary   string
+	Error     string
+	Budget    agent.BudgetReport
+	Workflow  domain.CoderWorkflow
 }
 
 type Engine struct {
-	provider provider.Provider
-	tools    agent.ToolDispatcher
-	store    *Store
-	options  func() agent.Options
+	provider      provider.Provider
+	tools         agent.ToolDispatcher
+	store         *Store
+	options       func() agent.Options
 	telemetrySink func(context.Context, telemetry.SessionEvent) error
 }
 
@@ -332,7 +332,8 @@ func (e *Engine) runOrchestrator(ctx context.Context, wf domain.CoderWorkflow) (
 		Termination:      string(stopReason),
 		WorkflowID:       wf.ID,
 		Agent:            string(domain.WorkflowAgentOrchestrator),
-		Summary:          strings.TrimSpace(raw),
+		InputMessages:    cloneDomainMessages([]domain.Message{{Role: domain.RoleSystem, Content: orchestratorPrompt}, {Role: domain.RoleUser, Content: wf.UserPrompt}}),
+		OutputMessage:    &domain.Message{Role: domain.RoleAssistant, Content: strings.TrimSpace(raw)},
 	})
 	if strings.TrimSpace(out.EnrichedPrompt) == "" {
 		out.EnrichedPrompt = strings.TrimSpace(raw)
@@ -369,9 +370,13 @@ func (e *Engine) runPlanner(ctx context.Context, wf domain.CoderWorkflow, revisi
 		Termination:      string(stopReason),
 		WorkflowID:       wf.ID,
 		Agent:            string(domain.WorkflowAgentPlanner),
-		Summary:          strings.TrimSpace(raw),
+		InputMessages:    cloneDomainMessages([]domain.Message{{Role: domain.RoleSystem, Content: plannerPrompt}, {Role: domain.RoleUser, Content: input}}),
+		OutputMessage:    &domain.Message{Role: domain.RoleAssistant, Content: strings.TrimSpace(raw)},
 	})
 	normalizePlannerPlan(&out)
+	if err := validatePlannerPlan(out); err != nil {
+		return domain.PlannerPlan{}, raw, input, err
+	}
 	for i := range out.Tasks {
 		if out.Tasks[i].Status == "" {
 			out.Tasks[i].Status = domain.WorkflowTaskPending
@@ -386,7 +391,13 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 		systemPrompt = solutionerPrompt
 	}
 	opts := e.options()
+	opts.MaxIterations = taskMaxIterations(task, opts.MaxIterations)
 	opts.OnTurn = func(turn agent.Turn, budget agent.BudgetReport, iteration, maxIterations int) {
+		output := cloneDomainMessages([]domain.Message{turn.Response.Message})
+		var outputMessage *domain.Message
+		if len(output) == 1 {
+			outputMessage = &output[0]
+		}
 		e.recordTelemetry(ctx, telemetry.SessionEvent{
 			Mode:             "coder",
 			Kind:             "task_llm_turn",
@@ -402,9 +413,11 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 			TaskID:           task.ID,
 			Agent:            string(task.OwnerAgent),
 			ToolCalls:        toolCallNames(turn.ToolCalls),
+			ToolCallDetails:  cloneToolCalls(turn.ToolCalls),
 			ToolResults:      len(turn.ToolResults),
+			InputMessages:    cloneDomainMessages(turn.Request.Messages),
+			OutputMessage:    outputMessage,
 			Error:            errorString(turn.Err),
-			Summary:          strings.TrimSpace(turn.Response.Message.Content),
 		})
 		emitProgress(onProgress, ProgressEvent{
 			Kind:      "turn",
@@ -415,12 +428,42 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 			Workflow:  cloneWorkflow(wf),
 		})
 	}
+	opts.OnToolResults = func(turn agent.Turn, iteration, maxIterations int) {
+		for i, call := range turn.ToolCalls {
+			var resultDetails []domain.ToolResult
+			if i < len(turn.ToolResults) {
+				resultDetails = cloneToolResults([]domain.ToolResult{turn.ToolResults[i]})
+			}
+			outcome, recoverable := telemetry.ToolExecOutcome(resultDetails)
+			e.recordTelemetry(ctx, telemetry.SessionEvent{
+				Mode:              "coder",
+				Kind:              "tool_exec",
+				Outcome:           outcome,
+				Recoverable:       recoverable,
+				Model:             "",
+				DurationMs:        turn.ToolDuration.Milliseconds(),
+				WorkflowID:        wf.ID,
+				TaskID:            task.ID,
+				Agent:             string(task.OwnerAgent),
+				ToolCalls:         toolCallNames([]domain.ToolCall{call}),
+				ToolCallDetails:   cloneToolCalls([]domain.ToolCall{call}),
+				ToolResults:       len(resultDetails),
+				ToolResultDetails: resultDetails,
+			})
+		}
+	}
 	messages := []domain.Message{
 		{Role: domain.RoleSystem, Content: systemPrompt},
 		{Role: domain.RoleSystem, Content: executionGuardPrompt},
 		{Role: domain.RoleSystem, Content: "Workflow execution context:\n" + taskExecutionContext(wf, task)},
-		{Role: domain.RoleUser, Content: fmt.Sprintf("Execute task %s: %s\n\nDescription:\n%s", task.ID, task.Title, task.Description)},
 	}
+	if directive := taskExecutionDirective(task); strings.TrimSpace(directive) != "" {
+		messages = append(messages, domain.Message{Role: domain.RoleSystem, Content: directive})
+	}
+	messages = append(messages, domain.Message{
+		Role:    domain.RoleUser,
+		Content: fmt.Sprintf("Execute task %s: %s\n\nDescription:\n%s", task.ID, task.Title, task.Description),
+	})
 	startedAt := time.Now().UTC()
 	state, err := agent.New(e.provider, e.tools).Run(ctx, messages, opts)
 	if err != nil {
@@ -475,15 +518,15 @@ func (e *Engine) executeTask(ctx context.Context, wf domain.CoderWorkflow, task 
 			"summary":     out.Summary,
 			"status":      out.Status,
 		},
-		PromptTokens:     sumPromptTokens(state),
-		CompletionTokens: sumCompletionTokens(state),
-		TotalTokens:      sumTotalTokens(state),
-		BudgetPromptTokens: state.LastBudget.TotalPromptTokens,
-		BudgetPromptLimit: state.LastBudget.PromptLimit,
+		PromptTokens:         sumPromptTokens(state),
+		CompletionTokens:     sumCompletionTokens(state),
+		TotalTokens:          sumTotalTokens(state),
+		BudgetPromptTokens:   state.LastBudget.TotalPromptTokens,
+		BudgetPromptLimit:    state.LastBudget.PromptLimit,
 		BudgetOutputHeadroom: state.LastBudget.OutputHeadroom,
-		DurationMs:       completedAt.Sub(startedAt).Milliseconds(),
-		StartedAt:        startedAt,
-		CompletedAt:      completedAt,
+		DurationMs:           completedAt.Sub(startedAt).Milliseconds(),
+		StartedAt:            startedAt,
+		CompletedAt:          completedAt,
 	})
 	markReadyTasks(&wf)
 	if allDone(wf) {
@@ -525,7 +568,7 @@ func (e *Engine) finalizeExecutionState(ctx context.Context, task domain.Workflo
 		finalizeInstruction += " If this task required creating, editing, or deleting files and that change did not already happen through successful tool calls, do not claim success; instead respond with 'BLOCKED:' and explain what did not happen."
 	}
 	finalizeMessages = append(finalizeMessages, domain.Message{
-		Role: domain.RoleUser,
+		Role:    domain.RoleUser,
 		Content: finalizeInstruction,
 	})
 	finalizeOpts := opts
@@ -602,9 +645,29 @@ func cloneDomainMessages(messages []domain.Message) []domain.Message {
 			Content:      msg.Content,
 			CacheControl: msg.CacheControl,
 		}
-		copied.ToolCalls = append([]domain.ToolCall(nil), msg.ToolCalls...)
-		copied.ToolResults = append([]domain.ToolResult(nil), msg.ToolResults...)
+		copied.ToolCalls = cloneToolCalls(msg.ToolCalls)
+		copied.ToolResults = cloneToolResults(msg.ToolResults)
 		out = append(out, copied)
+	}
+	return out
+}
+
+func cloneToolCalls(calls []domain.ToolCall) []domain.ToolCall {
+	out := make([]domain.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, domain.ToolCall{
+			ID:        call.ID,
+			Name:      call.Name,
+			Arguments: append([]byte(nil), call.Arguments...),
+		})
+	}
+	return out
+}
+
+func cloneToolResults(results []domain.ToolResult) []domain.ToolResult {
+	out := make([]domain.ToolResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, result)
 	}
 	return out
 }
@@ -738,12 +801,46 @@ func normalizePlannerPlan(plan *domain.PlannerPlan) {
 		plan.Tasks[i].Phase = strings.TrimSpace(plan.Tasks[i].Phase)
 		plan.Tasks[i].Title = strings.TrimSpace(plan.Tasks[i].Title)
 		plan.Tasks[i].Description = strings.TrimSpace(plan.Tasks[i].Description)
-		if plan.Tasks[i].OwnerAgent == "" {
-			plan.Tasks[i].OwnerAgent = domain.WorkflowAgentSolutioner
-		}
+		plan.Tasks[i].OwnerAgent = normalizeTaskOwner(plan.Tasks[i])
 		for j := range plan.Tasks[i].Dependencies {
 			plan.Tasks[i].Dependencies[j] = strings.TrimSpace(plan.Tasks[i].Dependencies[j])
 		}
+	}
+}
+
+func validatePlannerPlan(plan domain.PlannerPlan) error {
+	if len(plan.Tasks) == 0 {
+		return fmt.Errorf("planner returned no tasks")
+	}
+	for _, task := range plan.Tasks {
+		if strings.TrimSpace(task.ID) == "" {
+			return fmt.Errorf("planner task is missing id")
+		}
+		if strings.TrimSpace(task.Title) == "" {
+			return fmt.Errorf("planner task %q is missing title", task.ID)
+		}
+		if strings.TrimSpace(task.Description) == "" {
+			return fmt.Errorf("planner task %q is missing description", task.ID)
+		}
+	}
+	return nil
+}
+
+func normalizeTaskOwner(task domain.WorkflowTask) domain.WorkflowAgent {
+	switch task.OwnerAgent {
+	case domain.WorkflowAgentArchitecture, domain.WorkflowAgentSolutioner, domain.WorkflowAgentTester, domain.WorkflowAgentReviewer:
+		return task.OwnerAgent
+	}
+	text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description))
+	switch {
+	case strings.Contains(text, "review"), strings.Contains(text, "regression"), strings.Contains(text, "bug risk"):
+		return domain.WorkflowAgentReviewer
+	case strings.Contains(text, "test"), strings.Contains(text, "verify"), strings.Contains(text, "validation"), strings.Contains(text, "assert"):
+		return domain.WorkflowAgentTester
+	case strings.Contains(text, "architecture"), strings.Contains(text, "design"), strings.Contains(text, "data flow"), strings.Contains(text, "codebase"):
+		return domain.WorkflowAgentArchitecture
+	default:
+		return domain.WorkflowAgentSolutioner
 	}
 }
 
@@ -753,44 +850,110 @@ func workflowJSON(wf domain.CoderWorkflow) string {
 }
 
 func taskExecutionContext(wf domain.CoderWorkflow, task domain.WorkflowTask) string {
-	type contextTask struct {
-		ID           string                    `json:"id"`
-		Title        string                    `json:"title"`
-		Status       domain.WorkflowTaskStatus `json:"status"`
-		OwnerAgent   domain.WorkflowAgent      `json:"owner_agent"`
-		Dependencies []string                  `json:"dependencies,omitempty"`
-		Outputs      []string                  `json:"outputs,omitempty"`
+	type handoffTask struct {
+		ID         string               `json:"id"`
+		Title      string               `json:"title"`
+		OwnerAgent domain.WorkflowAgent `json:"owner_agent"`
+		Outputs    []string             `json:"outputs,omitempty"`
+	}
+	type currentTask struct {
+		ID                 string               `json:"id"`
+		Title              string               `json:"title"`
+		Description        string               `json:"description"`
+		OwnerAgent         domain.WorkflowAgent `json:"owner_agent"`
+		AcceptanceCriteria []string             `json:"acceptance_criteria,omitempty"`
+		ExpectedOutputs    []string             `json:"expected_outputs,omitempty"`
 	}
 	ctx := struct {
-		WorkflowID     string              `json:"workflow_id"`
-		State          string              `json:"state"`
-		PlanVersion    int                 `json:"plan_version"`
-		UserPrompt     string              `json:"user_prompt"`
-		EnrichedPrompt string              `json:"enriched_prompt,omitempty"`
-		CurrentTask    domain.WorkflowTask `json:"current_task"`
-		RelevantTasks  []contextTask       `json:"relevant_tasks"`
+		WorkflowID         string        `json:"workflow_id"`
+		PlanVersion        int           `json:"plan_version"`
+		OriginalRequest    string        `json:"original_request"`
+		CurrentTask        currentTask   `json:"current_task"`
+		DependencyHandoffs []handoffTask `json:"dependency_handoffs,omitempty"`
 	}{
-		WorkflowID:     wf.ID,
-		State:          string(wf.State),
-		PlanVersion:    wf.PlanVersion,
-		UserPrompt:     wf.UserPrompt,
-		EnrichedPrompt: wf.EnrichedPrompt,
-		CurrentTask:    task,
+		WorkflowID:      wf.ID,
+		PlanVersion:     wf.PlanVersion,
+		OriginalRequest: wf.UserPrompt,
+		CurrentTask: currentTask{
+			ID:                 task.ID,
+			Title:              task.Title,
+			Description:        task.Description,
+			OwnerAgent:         task.OwnerAgent,
+			AcceptanceCriteria: append([]string(nil), task.AcceptanceCriteria...),
+			ExpectedOutputs:    append([]string(nil), task.Outputs...),
+		},
 	}
-	for _, item := range wf.Tasks {
-		if item.ID == task.ID || containsTaskID(task.Dependencies, item.ID) || containsTaskID(item.Dependencies, task.ID) || item.Status == domain.WorkflowTaskDone {
-			ctx.RelevantTasks = append(ctx.RelevantTasks, contextTask{
-				ID:           item.ID,
-				Title:        item.Title,
-				Status:       item.Status,
-				OwnerAgent:   item.OwnerAgent,
-				Dependencies: append([]string(nil), item.Dependencies...),
-				Outputs:      tailStrings(item.Outputs, 2),
-			})
+	for _, depID := range task.Dependencies {
+		item := findTask(wf, depID)
+		if strings.TrimSpace(item.ID) == "" {
+			continue
 		}
+		ctx.DependencyHandoffs = append(ctx.DependencyHandoffs, handoffTask{
+			ID:         item.ID,
+			Title:      item.Title,
+			OwnerAgent: item.OwnerAgent,
+			Outputs:    compactHandoffOutputs(item.Outputs),
+		})
 	}
 	data, _ := json.MarshalIndent(ctx, "", "  ")
 	return string(data)
+}
+
+func compactHandoffOutputs(outputs []string) []string {
+	items := tailStrings(outputs, 1)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if compact := compactSummary(item); strings.TrimSpace(compact) != "" {
+			out = append(out, compact)
+		}
+	}
+	return out
+}
+
+func taskExecutionDirective(task domain.WorkflowTask) string {
+	if taskRequiresWorkspaceMutation(task) {
+		return ""
+	}
+	return "This is a non-mutating task handoff. Prefer using dependency handoffs and evidence already collected by prior tasks. " +
+		"Do not create or modify files unless the task description explicitly requires it. " +
+		"Do not reopen the repository broadly if the handoff already provides enough information to answer."
+}
+
+func taskMaxIterations(task domain.WorkflowTask, current int) int {
+	if current <= 0 {
+		current = 50
+	}
+	if taskRequiresWorkspaceMutation(task) {
+		return current
+	}
+	limit := 8
+	if task.OwnerAgent == domain.WorkflowAgentArchitecture || task.OwnerAgent == domain.WorkflowAgentReviewer {
+		limit = 16
+	}
+	if current > limit {
+		return limit
+	}
+	return current
+}
+
+func taskRequiresWorkspaceMutation(task domain.WorkflowTask) bool {
+	text := strings.ToLower(strings.TrimSpace(task.Title + "\n" + task.Description + "\n" + strings.Join(task.AcceptanceCriteria, "\n") + "\n" + strings.Join(task.Outputs, "\n")))
+	for _, marker := range []string{
+		"create file", "write file", "write ", "edit ", "modify ", "update ", "delete ",
+		"overwrite ", "patch ", "run the script", "execute ", "save ", "generate file",
+		"exists at", "file exists", ".md file", ".go file", ".txt file", ".json file", ".toml file", ".yml file", ".yaml file",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	if strings.Contains(text, "transient, internal") || strings.Contains(text, "design notes") || strings.Contains(text, "flow map notes") {
+		return false
+	}
+	return false
 }
 
 func containsTaskID(items []string, want string) bool {
@@ -867,10 +1030,11 @@ Each task object must include:
 - acceptance_criteria
 - outputs
 
-Allowed owner_agent values: orchestrator, planner, architecture, solutioner, tester, reviewer.
+Allowed owner_agent values: architecture, solutioner, tester, reviewer.
 Allowed status values: pending.
 The Go engine owns the authoritative workflow JSON and task lifecycle.
 You only return the planner stage payload.
+Never assign execution tasks to orchestrator or planner. Those agents are stage-only and do not execute workflow tasks.
 No markdown, no prose outside JSON.`
 
 const architecturePrompt = `You are the architecture agent in apex-code coder mode.

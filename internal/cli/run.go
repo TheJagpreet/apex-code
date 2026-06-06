@@ -49,24 +49,24 @@ type Config struct {
 // Deps bundles the long-lived collaborators an agent run needs. Building them
 // once lets the one-shot, pipe, and interactive modes share identical wiring.
 type Deps struct {
-	Provider   provider.Provider
-	Registry   *tools.Registry
-	Dispatcher *tools.Dispatcher
-	Context    *contextmgr.Manager
-	Router     *tools.Router
-	Lazy       *tools.LazySet
-	Skills     *skills.Loader
-	Sessions   *session.Store
-	Telemetry  *telemetry.Store
-	TelemetryFiles *telemetry.FileStore
-	Collector  *telemetry.Collector
-	Workflows  *codermode.Store
-	Coder      *codermode.Engine
-	SessionID  string
-	SessionTurnSeq int
+	Provider           provider.Provider
+	Registry           *tools.Registry
+	Dispatcher         *tools.Dispatcher
+	Context            *contextmgr.Manager
+	Router             *tools.Router
+	Lazy               *tools.LazySet
+	Skills             *skills.Loader
+	Sessions           *session.Store
+	Telemetry          *telemetry.Store
+	TelemetryFiles     *telemetry.FileStore
+	Collector          *telemetry.Collector
+	Workflows          *codermode.Store
+	Coder              *codermode.Engine
+	SessionID          string
+	SessionTurnSeq     int
 	SessionTotalTokens int
-	Initial    []domain.Message
-	cfg        Config
+	Initial            []domain.Message
+	cfg                Config
 }
 
 // BuildDeps assembles the provider, tool registry, context manager, and the
@@ -360,6 +360,11 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 		d.SessionID = record.ID
 	}
 	for _, turn := range state.Turns {
+		output := cloneMessages([]domain.Message{turn.Response.Message})
+		var outputMessage *domain.Message
+		if len(output) == 1 {
+			outputMessage = &output[0]
+		}
 		if err := d.appendSessionEvent(ctx, telemetry.SessionEvent{
 			Mode:             "chat",
 			Kind:             "llm_turn",
@@ -372,12 +377,36 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 			DurationMs:       turn.Duration.Milliseconds(),
 			Termination:      string(turn.Response.StopReason),
 			ToolCalls:        toolCallNames(turn.ToolCalls),
+			ToolCallDetails:  cloneToolCalls(turn.ToolCalls),
 			ToolResults:      len(turn.ToolResults),
+			InputMessages:    cloneMessages(turn.Request.Messages),
+			OutputMessage:    outputMessage,
 			SavedBy:          savedBy,
 			Error:            errorString(turn.Err),
-			Summary:          summarizeTurn(turn),
 		}); err != nil {
 			return err
+		}
+		for i, call := range turn.ToolCalls {
+			var resultDetails []domain.ToolResult
+			if i < len(turn.ToolResults) {
+				resultDetails = cloneToolResults([]domain.ToolResult{turn.ToolResults[i]})
+			}
+			outcome, recoverable := telemetry.ToolExecOutcome(resultDetails)
+			if err := d.appendSessionEvent(ctx, telemetry.SessionEvent{
+				Mode:              "chat",
+				Kind:              "tool_exec",
+				Outcome:           outcome,
+				Recoverable:       recoverable,
+				Model:             d.cfg.Model,
+				DurationMs:        turn.ToolDuration.Milliseconds(),
+				Termination:       string(turn.Response.StopReason),
+				ToolCalls:         toolCallNames([]domain.ToolCall{call}),
+				ToolCallDetails:   cloneToolCalls([]domain.ToolCall{call}),
+				ToolResults:       len(resultDetails),
+				ToolResultDetails: resultDetails,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -428,24 +457,6 @@ func (d *Deps) appendSessionEvent(ctx context.Context, event telemetry.SessionEv
 			Model: d.cfg.Model,
 			CWD:   d.cfg.CWD,
 		}, event); err != nil {
-			return err
-		}
-	}
-	if d.Telemetry != nil {
-		if err := d.Telemetry.SaveTurn(ctx, telemetry.TurnMetric{
-			SessionID:        sessionID,
-			TurnIndex:        event.Index,
-			Model:            event.Model,
-			PromptTokens:     event.PromptTokens,
-			CompletionTokens: event.CompletionTokens,
-			TotalTokens:      event.TotalTokens,
-			CacheCreation:    event.CacheCreation,
-			CacheRead:        event.CacheRead,
-			DurationMs:       event.DurationMs,
-			Termination:      event.Termination,
-			SavedBy:          cloneSavedBy(event.SavedBy),
-			CreatedAt:        event.Timestamp.Unix(),
-		}); err != nil {
 			return err
 		}
 	}
@@ -504,16 +515,6 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-func summarizeTurn(turn agent.Turn) string {
-	if strings.TrimSpace(turn.Response.Message.Content) != "" {
-		return strings.TrimSpace(turn.Response.Message.Content)
-	}
-	if len(turn.ToolCalls) > 0 {
-		return "tool_use"
-	}
-	return ""
-}
-
 func filepathDir(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return "."
@@ -527,10 +528,30 @@ func cloneMessages(messages []domain.Message) []domain.Message {
 		out = append(out, domain.Message{
 			Role:         m.Role,
 			Content:      m.Content,
-			ToolCalls:    append([]domain.ToolCall(nil), m.ToolCalls...),
-			ToolResults:  append([]domain.ToolResult(nil), m.ToolResults...),
+			ToolCalls:    cloneToolCalls(m.ToolCalls),
+			ToolResults:  cloneToolResults(m.ToolResults),
 			CacheControl: m.CacheControl,
 		})
+	}
+	return out
+}
+
+func cloneToolCalls(calls []domain.ToolCall) []domain.ToolCall {
+	out := make([]domain.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, domain.ToolCall{
+			ID:        call.ID,
+			Name:      call.Name,
+			Arguments: append([]byte(nil), call.Arguments...),
+		})
+	}
+	return out
+}
+
+func cloneToolResults(results []domain.ToolResult) []domain.ToolResult {
+	out := make([]domain.ToolResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, result)
 	}
 	return out
 }

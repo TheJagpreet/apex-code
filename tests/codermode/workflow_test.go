@@ -393,6 +393,39 @@ func TestEnginePlannerAcceptsScalarTaskLists(t *testing.T) {
 	}
 }
 
+func TestEnginePlannerNormalizesStageAgentsToWorkerAgents(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Create a file","planner_instructions":"do it"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: `{"summary":"Plan ready","phases":[{"name":"build","description":"do it","task_ids":["t1","t2","t3"]}],"tasks":[{"id":"t1","phase":"build","title":"Inspect architecture","description":"Analyze the architecture before edits","dependencies":[],"status":"pending","owner_agent":"planner","acceptance_criteria":["Architecture understood"],"outputs":[]},{"id":"t2","phase":"build","title":"Create file","description":"Write the implementation file","dependencies":["t1"],"status":"pending","owner_agent":"orchestrator","acceptance_criteria":["File created"],"outputs":[]},{"id":"t3","phase":"build","title":"Run tests","description":"Verify the feature with tests","dependencies":["t2"],"status":"pending","owner_agent":"planner","acceptance_criteria":["Tests pass"],"outputs":[]}]}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 2}
+	})
+	wf, err := engine.CreatePlan(context.Background(), "session-stage-owner", "create a file")
+	if err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	if got := wf.Tasks[0].OwnerAgent; got != domain.WorkflowAgentArchitecture {
+		t.Fatalf("task 1 owner = %s, want architecture", got)
+	}
+	if got := wf.Tasks[1].OwnerAgent; got != domain.WorkflowAgentSolutioner {
+		t.Fatalf("task 2 owner = %s, want solutioner", got)
+	}
+	if got := wf.Tasks[2].OwnerAgent; got != domain.WorkflowAgentTester {
+		t.Fatalf("task 3 owner = %s, want tester", got)
+	}
+}
+
 func TestEnginePersistsFailedPlanningWorkflow(t *testing.T) {
 	store, err := codermode.OpenStore(t.TempDir())
 	if err != nil {
@@ -427,6 +460,37 @@ func TestEnginePersistsFailedPlanningWorkflow(t *testing.T) {
 	}
 	if len(items[0].RunHistory) == 0 || items[0].RunHistory[len(items[0].RunHistory)-1].Error == "" {
 		t.Fatalf("expected failure recorded in run history: %+v", items[0].RunHistory)
+	}
+}
+
+func TestEngineRejectsWrongPlannerJSONShape(t *testing.T) {
+	store, err := codermode.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	p := fake.New(nil).WithScripts([][]provider.StreamEvent{
+		{
+			{Kind: provider.EventText, Text: `{"enriched_prompt":"Create arch.md","planner_instructions":"make a plan"}`},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+		{
+			{Kind: provider.EventText, Text: "```json\n{\"enriched_prompt\":\"Create arch.md\",\"planner_instructions\":\"one task\"}\n```"},
+			{Kind: provider.EventDone, StopReason: domain.StopEndTurn},
+		},
+	})
+	engine := codermode.NewEngine(p, agent.StubToolDispatcher{}, store, func() agent.Options {
+		return agent.Options{MaxIterations: 2}
+	})
+	_, err = engine.CreatePlan(context.Background(), "session-wrong-shape", "Create arch.md")
+	if err == nil || !strings.Contains(err.Error(), "planner returned no tasks") {
+		t.Fatalf("expected wrong planner shape error, got %v", err)
+	}
+	items, listErr := store.List(context.Background())
+	if listErr != nil {
+		t.Fatalf("list workflows: %v", listErr)
+	}
+	if len(items) != 1 || items[0].State != domain.WorkflowStateFailed {
+		t.Fatalf("expected failed workflow persisted, got %+v", items)
 	}
 }
 

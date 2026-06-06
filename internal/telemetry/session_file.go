@@ -9,29 +9,36 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/apex-code/apex/internal/domain"
 )
 
 type SessionEvent struct {
-	Index            int            `json:"index"`
-	Timestamp        time.Time      `json:"timestamp"`
-	Mode             string         `json:"mode,omitempty"`
-	Kind             string         `json:"kind"`
-	Model            string         `json:"model,omitempty"`
-	PromptTokens     int            `json:"prompt_tokens,omitempty"`
-	CompletionTokens int            `json:"completion_tokens,omitempty"`
-	TotalTokens      int            `json:"total_tokens,omitempty"`
-	CacheCreation    int            `json:"cache_creation_tokens,omitempty"`
-	CacheRead        int            `json:"cache_read_tokens,omitempty"`
-	DurationMs       int64          `json:"duration_ms,omitempty"`
-	Termination      string         `json:"termination,omitempty"`
-	WorkflowID       string         `json:"workflow_id,omitempty"`
-	TaskID           string         `json:"task_id,omitempty"`
-	Agent            string         `json:"agent,omitempty"`
-	ToolCalls        []string       `json:"tool_calls,omitempty"`
-	ToolResults      int            `json:"tool_results,omitempty"`
-	SavedBy          map[string]int `json:"saved_by,omitempty"`
-	Summary          string         `json:"summary,omitempty"`
-	Error            string         `json:"error,omitempty"`
+	Index             int                 `json:"index"`
+	Timestamp         time.Time           `json:"timestamp"`
+	Mode              string              `json:"mode,omitempty"`
+	Kind              string              `json:"kind"`
+	Outcome           string              `json:"outcome,omitempty"`
+	Recoverable       bool                `json:"recoverable,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	PromptTokens      int                 `json:"prompt_tokens,omitempty"`
+	CompletionTokens  int                 `json:"completion_tokens,omitempty"`
+	TotalTokens       int                 `json:"total_tokens,omitempty"`
+	CacheCreation     int                 `json:"cache_creation_tokens,omitempty"`
+	CacheRead         int                 `json:"cache_read_tokens,omitempty"`
+	DurationMs        int64               `json:"duration_ms,omitempty"`
+	Termination       string              `json:"termination,omitempty"`
+	WorkflowID        string              `json:"workflow_id,omitempty"`
+	TaskID            string              `json:"task_id,omitempty"`
+	Agent             string              `json:"agent,omitempty"`
+	ToolCalls         []string            `json:"tool_calls,omitempty"`
+	ToolCallDetails   []domain.ToolCall   `json:"tool_call_details,omitempty"`
+	ToolResults       int                 `json:"tool_results,omitempty"`
+	ToolResultDetails []domain.ToolResult `json:"tool_result_details,omitempty"`
+	InputMessages     []domain.Message    `json:"input_messages,omitempty"`
+	OutputMessage     *domain.Message     `json:"output_message,omitempty"`
+	SavedBy           map[string]int      `json:"saved_by,omitempty"`
+	Error             string              `json:"error,omitempty"`
 }
 
 type SessionArtifact struct {
@@ -215,11 +222,65 @@ func sanitizeSessionPart(v string) string {
 func cloneSessionEvent(in SessionEvent) SessionEvent {
 	out := in
 	out.ToolCalls = append([]string(nil), in.ToolCalls...)
+	if len(in.ToolCallDetails) > 0 {
+		out.ToolCallDetails = make([]domain.ToolCall, 0, len(in.ToolCallDetails))
+		for _, call := range in.ToolCallDetails {
+			out.ToolCallDetails = append(out.ToolCallDetails, domain.ToolCall{
+				ID:        call.ID,
+				Name:      call.Name,
+				Arguments: append(json.RawMessage(nil), call.Arguments...),
+			})
+		}
+	}
+	if len(in.ToolResultDetails) > 0 {
+		out.ToolResultDetails = make([]domain.ToolResult, 0, len(in.ToolResultDetails))
+		for _, result := range in.ToolResultDetails {
+			out.ToolResultDetails = append(out.ToolResultDetails, result)
+		}
+	}
+	if len(in.InputMessages) > 0 {
+		out.InputMessages = cloneMessages(in.InputMessages)
+	}
+	if in.OutputMessage != nil {
+		copied := cloneMessages([]domain.Message{*in.OutputMessage})
+		if len(copied) == 1 {
+			out.OutputMessage = &copied[0]
+		}
+	}
 	if len(in.SavedBy) > 0 {
 		out.SavedBy = make(map[string]int, len(in.SavedBy))
 		for k, v := range in.SavedBy {
 			out.SavedBy[k] = v
 		}
+	}
+	return out
+}
+
+func cloneMessages(messages []domain.Message) []domain.Message {
+	out := make([]domain.Message, 0, len(messages))
+	for _, msg := range messages {
+		copied := domain.Message{
+			Role:         msg.Role,
+			Content:      msg.Content,
+			CacheControl: msg.CacheControl,
+		}
+		if len(msg.ToolCalls) > 0 {
+			copied.ToolCalls = make([]domain.ToolCall, 0, len(msg.ToolCalls))
+			for _, call := range msg.ToolCalls {
+				copied.ToolCalls = append(copied.ToolCalls, domain.ToolCall{
+					ID:        call.ID,
+					Name:      call.Name,
+					Arguments: append(json.RawMessage(nil), call.Arguments...),
+				})
+			}
+		}
+		if len(msg.ToolResults) > 0 {
+			copied.ToolResults = make([]domain.ToolResult, 0, len(msg.ToolResults))
+			for _, result := range msg.ToolResults {
+				copied.ToolResults = append(copied.ToolResults, result)
+			}
+		}
+		out = append(out, copied)
 	}
 	return out
 }

@@ -33,6 +33,9 @@ func TestRegistryDescribeAndDispatch(t *testing.T) {
 	if len(results) != 1 || !strings.Contains(results[0].Content, "summary:") {
 		t.Fatalf("results = %+v", results)
 	}
+	if strings.Contains(results[0].Content, "\ntokens: ") {
+		t.Fatalf("tool content should not include token accounting: %+v", results[0])
+	}
 }
 
 func TestReadFileToolRequiresRangeForLargeFiles(t *testing.T) {

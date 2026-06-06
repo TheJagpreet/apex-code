@@ -152,6 +152,8 @@ var slashCommands = []commandSpec{
 	{Name: "/review", Usage: "/review", Description: "insert the code review starter"},
 	{Name: "/fix", Usage: "/fix", Description: "insert the debug and fix starter"},
 	{Name: "/test", Usage: "/test", Description: "insert the testing starter"},
+	{Name: "/chat", Usage: "/chat", Description: "switch to normal chat mode"},
+	{Name: "/coder", Usage: "/coder", Description: "switch to coder workflow mode"},
 	{Name: "/mode", Usage: "/mode [chat|coder]", Description: "show or switch the active interaction mode"},
 	{Name: "/plan", Usage: "/plan", Description: "show the current coder workflow plan"},
 	{Name: "/approve", Usage: "/approve", Description: "approve the current coder plan and start execution"},
@@ -388,12 +390,24 @@ func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
 
 func renderBadgeRow(status runtimeStatus) string {
 	badges := []string{
+		styleBadgeOff.Render(compactSessionLabel(status.Session)),
 		styleBadgeOn.Render("mode " + status.Mode),
 		styleBadgeOn.Render("companion " + status.Companion),
 		styleBadgeOff.Render(status.ContextSummary),
 		styleBadgeOff.Render("cwd " + status.CWD),
 	}
 	return strings.Join(badges, " ")
+}
+
+func compactSessionLabel(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "new"
+	}
+	if len(label) <= 8 {
+		return label
+	}
+	return label[:8] + "..."
 }
 
 func renderToolInspector(calls []ToolCallView) string {
@@ -512,7 +526,7 @@ func renderHelpPane() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, width int, verbose bool, copyStatus string, working bool) string {
+func renderComposer(input string, cursorPos int, suggestions []suggestion, idx int, pane Pane, width int, verbose bool, copyStatus string, working bool) string {
 	var b strings.Builder
 	rule := strings.Repeat("─", composerWidth(width))
 	ruleStyle := styleComposerIdle
@@ -525,7 +539,15 @@ func renderComposer(input string, suggestions []suggestion, idx int, pane Pane, 
 	if working {
 		cursor = ""
 	}
-	b.WriteString(input + cursor)
+	runes := []rune(input)
+	if cursorPos < 0 {
+		cursorPos = 0
+	}
+	if cursorPos > len(runes) {
+		cursorPos = len(runes)
+	}
+	line := string(runes[:cursorPos]) + cursor + string(runes[cursorPos:])
+	b.WriteString(line)
 	b.WriteString("\n")
 	b.WriteString(ruleStyle.Render(rule))
 	if len(suggestions) > 0 {

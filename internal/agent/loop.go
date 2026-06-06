@@ -37,13 +37,14 @@ const (
 
 // Turn captures one provider round trip and any tool work that followed it.
 type Turn struct {
-	Request     domain.Request
-	Response    domain.Response
-	ToolCalls   []domain.ToolCall
-	ToolResults []domain.ToolResult
-	Budget      BudgetReport
-	Duration    time.Duration
-	Err         error
+	Request      domain.Request
+	Response     domain.Response
+	ToolCalls    []domain.ToolCall
+	ToolResults  []domain.ToolResult
+	ToolDuration time.Duration
+	Budget       BudgetReport
+	Duration     time.Duration
+	Err          error
 }
 
 // LoopState tracks where the agent loop is and what has happened so far.
@@ -73,6 +74,7 @@ type Options struct {
 	Logger          *slog.Logger
 	Compactor       Compactor
 	OnTurn          func(Turn, BudgetReport, int, int)
+	OnToolResults   func(Turn, int, int)
 
 	// StreamText, when set, is invoked with each assistant text delta as it is
 	// received from the provider, enabling live streaming UIs. It does not change
@@ -218,9 +220,14 @@ func (l *Loop) Run(ctx context.Context, messages []domain.Message, opts Options)
 		}
 
 		state.Phase = PhaseAct
+		toolStarted := time.Now()
 		results, err := l.tools.DispatchToolCalls(ctx, turn.ToolCalls)
+		turn.ToolDuration = time.Since(toolStarted)
 		turn.ToolResults = cloneToolResults(results)
 		state.Turns[len(state.Turns)-1] = turn
+		if opts.OnToolResults != nil {
+			opts.OnToolResults(turn, state.Iteration, state.MaxIterations)
+		}
 		if err != nil {
 			state.Phase = PhaseDone
 			state.TerminationReason = TerminationError
