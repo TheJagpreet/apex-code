@@ -86,6 +86,20 @@ One-shot usage:
 git diff | ./apex "review these changes"
 ```
 
+Stats and session artifacts:
+
+```bash
+./apex --stats
+./apex stats
+./apex stats -session <session-id>
+./apex stats -data-dir /path/to/.apex
+```
+
+By default apex reads and writes session data under `.apex/`. Use `-data-dir`
+or `APEX_DATA_DIR` to point at a different artifact directory. The stats command
+parses `.apex/sessions/`, generates a luxury dark HTML dashboard under
+`.apex/stats/index.html`, and opens it in your default browser.
+
 Provider selection is automatic:
 
 - If `.env` or your shell exports `APEX_PROVIDER=openai` or `OPENAI_API_KEY`, apex uses OpenAI.

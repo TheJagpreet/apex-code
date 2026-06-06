@@ -52,6 +52,7 @@ failures.
 Inspect telemetry from the CLI:
 
 ```bash
+apex --stats
 apex stats
 apex stats -by-model
 apex stats -by-session
@@ -59,8 +60,26 @@ apex stats -trace 20
 apex stats -session <id>
 ```
 
-These commands roll up only real LLM events; standalone tool-execution events are
-not counted as model token usage.
+Default behavior:
+
+- `apex stats` reads from `.apex/` in the current working directory
+- `apex --stats` is a top-level shortcut to open the same dashboard
+- use `-data-dir <path>` or `APEX_DATA_DIR` to inspect another artifact root
+
+`apex stats` parses `.apex/sessions/`, writes a dark HTML dashboard to
+`.apex/stats/index.html`, and opens it in the default browser.
+
+The dashboard includes:
+
+- overall token, timing, session, workflow, and mode totals
+- recent sessions with titles and usage
+- model usage
+- tool activity and error counts
+- coder-agent activity
+- recent LLM calls
+
+Only real LLM events count toward model token usage; standalone tool-execution
+events are tracked separately in the report.
 
 ## CLI reference
 

@@ -30,8 +30,6 @@ Switch directly with:
 - `/chat`
 - `/coder`
 
-`/mode [chat|coder]` still works as a compatibility command.
-
 ## Coder mode
 
 Coder mode adds a workflow-oriented execution path for longer jobs:
@@ -54,7 +52,6 @@ Workflow JSON files are stored under the active session folder in `workflows/`.
 | `/explain` `/review` `/fix` `/test` | Insert a prompt starter |
 | `/model [name]` | Show or switch the active model |
 | `/chat` · `/coder` | Switch directly between chat mode and coder mode |
-| `/mode [chat|coder]` | Show or switch the active interaction mode |
 | `/plan` | Print the current coder workflow plan into chat |
 | `/approve` | Approve the current coder-mode plan and start execution |
 | `/replan <feedback>` | Ask the planner to revise the current plan |
@@ -99,6 +96,11 @@ Useful session flows:
 - `/resume` resumes a previous session
 
 Session storage and telemetry are covered in [OPERATIONS.md](./OPERATIONS.md).
+
+Outside the TUI, `apex stats` and `apex --stats` read the current project's
+`.apex/` directory by default, generate a browser dashboard at
+`.apex/stats/index.html`, and open it automatically. Use `-data-dir` if you
+want to inspect a different artifact root.
 
 ## Related docs
 

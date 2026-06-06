@@ -13,6 +13,7 @@ import (
 
 	"github.com/apex-code/apex/internal/config"
 	"github.com/apex-code/apex/internal/mcp"
+	"github.com/apex-code/apex/internal/session"
 	"github.com/apex-code/apex/internal/telemetry"
 	"github.com/apex-code/apex/internal/tui"
 )
@@ -43,6 +44,7 @@ func (m Mode) String() string {
 // Main parses flags, picks an invocation mode, and runs apex. It returns a
 // process exit code.
 func Main(args []string) int {
+	args = normalizeCLIArgs(args)
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
 		case "stats":
@@ -59,13 +61,12 @@ func Main(args []string) int {
 		provider   = fs.String("provider", "ollama", "model provider (ollama or openai)")
 		model      = fs.String("model", "", "provider model name")
 		baseURL    = fs.String("base-url", "", "provider base URL")
-		ollamaURL  = fs.String("ollama-url", "", "deprecated alias for -base-url when using Ollama")
+		statsView  = fs.Bool("stats", false, "open the stats dashboard in your browser")
 		maxIter    = fs.Int("max-iterations", 50, "maximum agent loop turns before stopping")
 		verbose    = fs.Bool("verbose", false, "show expanded technical details in the TUI")
 		lazyTools  = fs.Bool("lazy-tools", false, "advertise tool/skill names only; inject full schemas on demand (plan 8)")
 		skillsDir  = fs.String("skills", defaultSkillsDir(), "directory of skill bundles")
 		dataDir    = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
-		stateDB    = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
 		resume     = fs.String("resume", "", "resume a prior session by id or 'latest'")
 		forceTUI   = fs.Bool("tui", false, "force the interactive TUI even with a prompt argument")
 		forceShell = fs.Bool("one-shot", false, "force one-shot mode (never launch the TUI)")
@@ -75,24 +76,22 @@ func Main(args []string) int {
 	}
 
 	cwd, _ := os.Getwd()
-	resolvedBaseURL := strings.TrimSpace(*baseURL)
-	if resolvedBaseURL == "" {
-		resolvedBaseURL = strings.TrimSpace(*ollamaURL)
-	}
 	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
 		Provider:      nonDefaultString(*provider, "ollama"),
 		Model:         nonEmptyString(*model),
-		BaseURL:       nonEmptyString(resolvedBaseURL),
+		BaseURL:       nonEmptyString(*baseURL),
 		MaxIterations: nonDefaultInt(*maxIter, 50),
 		LazyTools:     nonDefaultBool(*lazyTools, false),
 		SkillRoots:    nonDefaultRoots(*skillsDir, defaultSkillsDir()),
 		DataDir:       nonEmptyString(*dataDir),
-		StateDBPath:   nonEmptyString(*stateDB),
 		Resume:        nonEmptyString(*resume),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
+	}
+	if *statsView {
+		return openStatsDashboard(settings.DataDir, "", true, true, 8)
 	}
 
 	cfg := Config{
@@ -107,7 +106,6 @@ func Main(args []string) int {
 		BudgetSet:     settings.BudgetSet,
 		CWD:           cwd,
 		DataDir:       settings.DataDir,
-		StateDBPath:   settings.StateDBPath,
 		Resume:        settings.Resume,
 		Features:      settings.Features,
 		MCPServers:    settings.MCPServers,
@@ -162,6 +160,18 @@ func Main(args []string) int {
 		}
 		return 0
 	}
+}
+
+func normalizeCLIArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--") && arg != "--" {
+			out = append(out, "-"+strings.TrimPrefix(arg, "--"))
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func runOnceToStdout(ctx context.Context, deps *Deps, prompt string) error {
@@ -249,8 +259,7 @@ func runStats(args []string) int {
 	fs := flag.NewFlagSet("apex stats", flag.ContinueOnError)
 	var (
 		dataDir   = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
-		stateDB   = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
-		session   = fs.String("session", "", "optional session id to scope the stats")
+		sessionID = fs.String("session", "", "optional session id to scope the stats")
 		byModel   = fs.Bool("by-model", false, "break usage down per model")
 		bySession = fs.Bool("by-session", false, "break usage down per session id")
 		trace     = fs.Int("trace", 0, "show the N most recent turn-level traces")
@@ -258,16 +267,16 @@ func runStats(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	_ = byModel
 	cwd, _ := os.Getwd()
 	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
-		DataDir:     nonEmptyString(*dataDir),
-		StateDBPath: nonEmptyString(*stateDB),
+		DataDir: nonEmptyString(*dataDir),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
 	}
-	store, err := telemetry.Open(settings.StateDBPath)
+	store, err := telemetry.Open(settings.DataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
@@ -275,42 +284,33 @@ func runStats(args []string) int {
 	defer store.Close()
 
 	ctx := context.Background()
-	sessionID := strings.TrimSpace(*session)
-
-	total, err := store.Totals(ctx, sessionID)
+	selectedSessionID := strings.TrimSpace(*sessionID)
+	sessStore, err := session.Open(settings.DataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
 	}
-	fmt.Println(telemetry.FormatTotals(total))
+	defer sessStore.Close()
 
-	if *byModel {
-		rollup, err := store.ByModel(ctx, sessionID)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "apex:", err)
-			return 1
-		}
-		fmt.Println("\n[by model]")
-		fmt.Println(telemetry.FormatByModel(rollup))
-	}
-	if *bySession {
-		rollup, err := store.BySession(ctx)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "apex:", err)
-			return 1
-		}
-		fmt.Println("\n[by session]")
-		fmt.Println(telemetry.FormatByModel(rollup))
-	}
+	traceLimit := 8
 	if *trace > 0 {
-		traces, err := store.Recent(ctx, sessionID, *trace)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "apex:", err)
-			return 1
-		}
-		fmt.Println("\n[recent traces]")
-		fmt.Println(telemetry.FormatTrace(traces))
+		traceLimit = *trace
 	}
+	report, err := buildStatsReport(ctx, store, sessStore, selectedSessionID, traceLimit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "apex:", err)
+		return 1
+	}
+	path, err := writeStatsDashboard(settings.DataDir, report, selectedSessionID, true, *bySession)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "apex:", err)
+		return 1
+	}
+	if err := openBrowser(path); err != nil {
+		fmt.Fprintln(os.Stderr, "apex:", err)
+		return 1
+	}
+	fmt.Printf("Opened stats dashboard: %s\n", path)
 	return 0
 }
 
@@ -318,7 +318,6 @@ func runSessions(args []string) int {
 	fs := flag.NewFlagSet("apex sessions", flag.ContinueOnError)
 	var (
 		dataDir = fs.String("data-dir", "", "base directory for sessions, workflows, and telemetry")
-		stateDB = fs.String("state-db", "", "deprecated compatibility alias for the state path inside the data directory")
 		limit   = fs.Int("limit", 10, "maximum sessions to list")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -326,24 +325,23 @@ func runSessions(args []string) int {
 	}
 	cwd, _ := os.Getwd()
 	settings, err := config.Resolve(cwd, envMap(cwd), config.Partial{
-		DataDir:     nonEmptyString(*dataDir),
-		StateDBPath: nonEmptyString(*stateDB),
+		DataDir: nonEmptyString(*dataDir),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
 	}
-	deps, err := BuildDeps(Config{StateDBPath: settings.StateDBPath, Features: settings.Features})
+	store, err := session.Open(settings.DataDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1
 	}
-	defer deps.Close()
-	if deps.Sessions == nil {
+	defer store.Close()
+	if !settings.Features.Sessions {
 		fmt.Fprintln(os.Stderr, "apex: sessions are disabled")
 		return 1
 	}
-	records, err := deps.Sessions.List(context.Background(), *limit)
+	records, err := store.List(context.Background(), *limit)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "apex:", err)
 		return 1

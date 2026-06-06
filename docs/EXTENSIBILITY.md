@@ -20,8 +20,7 @@
 See [`docs/apex.toml.example`](./apex.toml.example) for a complete sample.
 
 The primary persistence knob is `data_dir`. By default apex stores sessions,
-telemetry, workflows, and indexes under `.apex/`. `state_path` remains
-available as a compatibility alias for older configs.
+telemetry, workflows, and indexes under `.apex/`.
 
 ## MCP
 

@@ -5,7 +5,6 @@ max_iterations = 8
 lazy_tools = true
 skills = [".apex/skills"]
 data_dir = ".apex"
-state_path = ".apex/state.json"
 resume = "latest"
 
 [budget]

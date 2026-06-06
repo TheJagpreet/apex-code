@@ -154,7 +154,6 @@ var slashCommands = []commandSpec{
 	{Name: "/test", Usage: "/test", Description: "insert the testing starter"},
 	{Name: "/chat", Usage: "/chat", Description: "switch to normal chat mode"},
 	{Name: "/coder", Usage: "/coder", Description: "switch to coder workflow mode"},
-	{Name: "/mode", Usage: "/mode [chat|coder]", Description: "show or switch the active interaction mode"},
 	{Name: "/plan", Usage: "/plan", Description: "show the current coder workflow plan"},
 	{Name: "/approve", Usage: "/approve", Description: "approve the current coder plan and start execution"},
 	{Name: "/replan", Usage: "/replan <feedback>", Description: "revise the current coder plan"},

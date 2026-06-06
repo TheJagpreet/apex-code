@@ -19,7 +19,6 @@ max_iterations = 4
 lazy_tools = true
 skills = ["skills/project"]
 data_dir = ".apex-project"
-state_path = ".apex-project/state.json"
 
 [budget]
 history = 0.25
@@ -33,7 +32,7 @@ history = 0.25
 	settings, err := config.Resolve(dir, map[string]string{
 		"APEX_PROVIDER":       "openai",
 		"OPENAI_API_KEY":      "sk-test",
-		"APEX_OLLAMA_URL":     "http://env",
+		"APEX_BASE_URL":       "http://env",
 		"APEX_MAX_ITERATIONS": "7",
 	}, config.Partial{
 		Provider:      stringPtr("ollama"),
@@ -60,8 +59,8 @@ history = 0.25
 	if settings.LazyTools {
 		t.Fatal("flag override should disable lazy tools")
 	}
-	if want := filepath.Join(dir, ".apex-project", "state.json"); settings.StateDBPath != want {
-		t.Fatalf("state path = %q, want %q", settings.StateDBPath, want)
+	if want := filepath.Join(dir, ".apex-project"); settings.DataDir != want {
+		t.Fatalf("data dir = %q, want %q", settings.DataDir, want)
 	}
 	if len(settings.SkillRoots) != 1 || settings.SkillRoots[0] != filepath.Join(dir, "skills", "project") {
 		t.Fatalf("skill roots = %v", settings.SkillRoots)

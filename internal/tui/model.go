@@ -650,28 +650,6 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		})
 		m.selectLatestEntry()
 		m.scrollToBottom()
-	case "/mode":
-		if len(fields) == 1 {
-			m.transcript = append(m.transcript, transcriptEntry{
-				Kind:  entryStatus,
-				Title: "Mode",
-				Body:  "Current mode: " + m.agent.Mode(),
-			})
-			m.selectLatestEntry()
-			m.scrollToBottom()
-			break
-		}
-		if err := m.agent.SetMode(m.ctx, fields[1]); err != nil {
-			return m, nil, err
-		}
-		m.workflow = m.agent.CoderWorkflow()
-		m.transcript = append(m.transcript, transcriptEntry{
-			Kind:  entryStatus,
-			Title: "Mode switched",
-			Body:  "Active mode is now " + m.agent.Mode(),
-		})
-		m.selectLatestEntry()
-		m.scrollToBottom()
 	case "/approve":
 		next, cmd := m.startCoderStreamAction("Approving plan", func(ctx context.Context, ch chan tea.Msg) (Reply, error) {
 			if _, err := m.agent.CoderApprove(ctx); err != nil {
@@ -1345,37 +1323,20 @@ func modeSuggestions(input string) []suggestion {
 		return nil
 	}
 	isDirectModePrefix := strings.HasPrefix("/chat", trimmed) || strings.HasPrefix("/coder", trimmed)
-	if !strings.HasPrefix(trimmed, "/mode") && !isDirectModePrefix {
+	if !isDirectModePrefix {
 		return nil
 	}
 	options := []suggestion{
 		{Label: "/chat", Insert: "/chat", Detail: "switch to normal chat mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
 		{Label: "/coder", Insert: "/coder", Detail: "switch to coder workflow mode", Kind: suggestionCommand, Replace: strings.TrimSpace(input)},
 	}
-	if trimmed == "/mode" || strings.HasPrefix(trimmed, "/mode ") {
-		if strings.HasPrefix(trimmed, "/mode chat") || strings.HasPrefix(trimmed, "/mode coder") {
-			return nil
+	var ranked []suggestion
+	for _, option := range options {
+		if strings.HasPrefix(strings.ToLower(option.Label), trimmed) {
+			ranked = append(ranked, option)
 		}
-		query := strings.TrimSpace(strings.TrimPrefix(trimmed, "/mode"))
-		if query == "" {
-			return options
-		}
-		var ranked []suggestion
-		for _, option := range options {
-			mode := strings.TrimPrefix(strings.ToLower(option.Label), "/")
-			if strings.HasPrefix(mode, query) {
-				ranked = append(ranked, option)
-			}
-		}
-		if len(ranked) > 0 {
-			return ranked
-		}
-		for _, option := range options {
-			mode := strings.TrimPrefix(strings.ToLower(option.Label), "/")
-			if strings.Contains(mode, query) {
-				ranked = append(ranked, option)
-			}
-		}
+	}
+	if len(ranked) > 1 {
 		return ranked
 	}
 	if trimmed == "/ch" || trimmed == "/cha" || trimmed == "/chat" || strings.HasPrefix("/chat", trimmed) {
@@ -1387,7 +1348,7 @@ func modeSuggestions(input string) []suggestion {
 	if trimmed == "/" {
 		return options
 	}
-	var ranked []suggestion
+	ranked = nil
 	for _, option := range options {
 		if strings.HasPrefix(strings.ToLower(option.Label), trimmed) {
 			ranked = append(ranked, option)

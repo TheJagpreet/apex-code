@@ -59,8 +59,8 @@ type Record struct {
 }
 
 type sessionDocument struct {
-	Record   Record      `json:"record"`
-	Snapshot Snapshot    `json:"snapshot"`
+	Record   Record       `json:"record"`
+	Snapshot Snapshot     `json:"snapshot"`
 	Turns    []TurnRecord `json:"turns"`
 }
 
@@ -189,6 +189,9 @@ func (s *Store) listDocuments() ([]sessionDocument, error) {
 		}
 		doc, err := s.readDocument(entry.Name())
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return nil, err
 		}
 		out = append(out, doc)
@@ -237,10 +240,19 @@ func sessionRoot(path string) string {
 	if strings.EqualFold(filepath.Base(clean), "sessions") {
 		return clean
 	}
-	if filepath.Ext(clean) != "" {
+	if looksLikeFilePath(clean) {
 		return filepath.Join(filepath.Dir(clean), "sessions")
 	}
 	return filepath.Join(clean, "sessions")
+}
+
+func looksLikeFilePath(path string) bool {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return false
+	}
+	base := filepath.Base(path)
+	return !strings.EqualFold(base, ext)
 }
 
 func sanitizeSessionID(v string) string {

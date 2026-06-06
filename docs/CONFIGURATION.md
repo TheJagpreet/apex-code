@@ -46,12 +46,10 @@ APEX_BASE_URL=http://localhost:11434
 | `-provider` | `APEX_PROVIDER` | `ollama` | Provider backend (`ollama` or `openai`) |
 | `-model` | `APEX_MODEL` | provider-specific | Model name |
 | `-base-url` | `APEX_BASE_URL` | provider-specific | Provider base URL |
-| `-ollama-url` | `APEX_OLLAMA_URL` | `http://localhost:11434` | Backward-compatible Ollama alias |
 | `-max-iterations` | `APEX_MAX_ITERATIONS` | `50` | Max agent loop turns |
 | `-lazy-tools` | `APEX_LAZY_TOOLS` | `false` | Advertise tool names and load schemas on demand |
 | `-skills` | `APEX_SKILLS_DIR` | `./skills` | Skill bundles directory |
 | `-data-dir` | `APEX_DATA_DIR` | `./.apex` | Base directory for sessions, workflows, telemetry, and indexes |
-| `-state-db` | `APEX_STATE_DB` | compatibility alias | Deprecated alias for the old state path |
 | `-resume` | `APEX_RESUME` | — | Resume a prior session |
 | `-verbose` | — | `false` | Expanded technical detail in the TUI |
 | `-tui` / `-one-shot` | — | auto | Force interactive or non-interactive mode |
@@ -117,6 +115,21 @@ By default apex stores state under `.apex/`:
       telemetry.json
       workflows/
         <timestamp>-<session-id>-<workflow-id>.json
+```
+
+`apex sessions`, `apex stats`, resume loading, and coder workflow lookup all read
+from this `sessions/` tree directly.
+
+If you do not pass `-data-dir`, apex uses `.apex/` in the current working
+directory. To use a different artifact root, pass `-data-dir` or set
+`APEX_DATA_DIR`.
+
+This also controls where the browser stats dashboard is written:
+
+```text
+.apex/
+  stats/
+    index.html
 ```
 
 ## Related docs

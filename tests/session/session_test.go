@@ -161,6 +161,43 @@ func TestResumedPromptStaysCompact(t *testing.T) {
 	}
 }
 
+func TestSessionStoreUsesDotPrefixedDataDirAsDirectory(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, ".apex")
+	store, err := session.Open(root)
+	if err != nil {
+		t.Fatalf("open session store: %v", err)
+	}
+	if _, _, err := saveFixture(context.Background(), store, contextmgr.WorkingSet{}); err != nil {
+		t.Fatalf("save fixture: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sessions")); err != nil {
+		t.Fatalf("expected sessions dir under dot-prefixed data dir: %v", err)
+	}
+}
+
+func TestSessionListSkipsFoldersWithoutSessionDocument(t *testing.T) {
+	root := t.TempDir()
+	store, err := session.Open(root)
+	if err != nil {
+		t.Fatalf("open session store: %v", err)
+	}
+	if _, _, err := saveFixture(context.Background(), store, contextmgr.WorkingSet{}); err != nil {
+		t.Fatalf("save fixture: %v", err)
+	}
+	extraDir := filepath.Join(root, "sessions", "telemetry-only")
+	if err := os.MkdirAll(extraDir, 0o755); err != nil {
+		t.Fatalf("mkdir extra dir: %v", err)
+	}
+	records, err := store.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected only resumable sessions, got %d", len(records))
+	}
+}
+
 func saveFixture(ctx context.Context, store *session.Store, ws contextmgr.WorkingSet) (session.Record, session.Snapshot, error) {
 	return store.Save(ctx, session.SaveInput{
 		Model:       "gemma4:e2b",

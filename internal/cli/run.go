@@ -39,8 +39,6 @@ type Config struct {
 	Prompt        string
 	CWD           string
 	DataDir       string
-	StateDBPath   string
-	WorkflowRoot  string
 	Resume        string
 	Features      config.Features
 	MCPServers    []config.MCPServer
@@ -99,34 +97,30 @@ func BuildDeps(cfg Config) (*Deps, error) {
 		cfg:        cfg,
 	}
 
-	if err := os.MkdirAll(filepathDir(cfg.StateDBPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create state dir: %w", err)
+	sessionRoot := sessionArtifactRoot(cfg.DataDir)
+	if err := os.MkdirAll(sessionRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("create sessions dir: %w", err)
 	}
 	if cfg.Features.Sessions {
-		store, err := session.Open(cfg.StateDBPath)
+		store, err := session.Open(cfg.DataDir)
 		if err != nil {
 			return nil, fmt.Errorf("open session store: %w", err)
 		}
 		deps.Sessions = store
 	}
 	if cfg.Features.Telemetry {
-		store, err := telemetry.Open(cfg.StateDBPath)
+		store, err := telemetry.Open(cfg.DataDir)
 		if err != nil {
 			return nil, fmt.Errorf("open telemetry store: %w", err)
 		}
 		deps.Telemetry = store
 	}
-	sessionRoot := filepath.Join(filepathDir(cfg.StateDBPath), "sessions")
 	files, err := telemetry.OpenFileStore(sessionRoot)
 	if err != nil {
 		return nil, fmt.Errorf("open session file store: %w", err)
 	}
 	deps.TelemetryFiles = files
-	workflowRoot := cfg.WorkflowRoot
-	if strings.TrimSpace(workflowRoot) == "" {
-		workflowRoot = sessionRoot
-	}
-	wfStore, err := codermode.OpenStore(workflowRoot)
+	wfStore, err := codermode.OpenStore(sessionRoot)
 	if err != nil {
 		return nil, fmt.Errorf("open workflow store: %w", err)
 	}
@@ -515,11 +509,11 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-func filepathDir(path string) string {
-	if strings.TrimSpace(path) == "" {
-		return "."
+func sessionArtifactRoot(dataDir string) string {
+	if strings.TrimSpace(dataDir) != "" {
+		return filepath.Join(filepath.Clean(dataDir), "sessions")
 	}
-	return filepath.Dir(path)
+	return filepath.Join(".", "sessions")
 }
 
 func cloneMessages(messages []domain.Message) []domain.Message {

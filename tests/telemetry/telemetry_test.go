@@ -286,3 +286,33 @@ func TestTelemetryRollupsIgnoreNonLLMEvents(t *testing.T) {
 		t.Fatalf("recent should ignore non-llm events: %+v", recent)
 	}
 }
+
+func TestTelemetryOpenUsesDotPrefixedDataDirAsDirectory(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, ".apex")
+	files, err := telemetry.OpenFileStore(filepath.Join(root, "sessions"))
+	if err != nil {
+		t.Fatalf("open file store: %v", err)
+	}
+	if err := files.AppendEvent(context.Background(), "sess-1", telemetry.FileMeta{Model: "deepseek-v4-flash"}, telemetry.SessionEvent{
+		Index:       1,
+		Timestamp:   time.Unix(1000, 0).UTC(),
+		Kind:        "llm_turn",
+		Model:       "deepseek-v4-flash",
+		TotalTokens: 15,
+	}); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	store, err := telemetry.Open(root)
+	if err != nil {
+		t.Fatalf("open telemetry store: %v", err)
+	}
+	defer store.Close()
+	totals, err := store.Totals(context.Background(), "")
+	if err != nil {
+		t.Fatalf("totals: %v", err)
+	}
+	if totals.TotalTokens != 15 || totals.Turns != 1 {
+		t.Fatalf("unexpected totals: %+v", totals)
+	}
+}

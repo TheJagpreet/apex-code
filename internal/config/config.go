@@ -36,7 +36,6 @@ type Settings struct {
 	LazyTools     bool
 	SkillRoots    []string
 	DataDir       string
-	StateDBPath   string
 	Resume        string
 	Budget        agent.BudgetFractions
 	BudgetSet     bool
@@ -56,7 +55,6 @@ type Partial struct {
 	LazyTools     *bool
 	SkillRoots    []string
 	DataDir       *string
-	StateDBPath   *string
 	Resume        *string
 	Budget        *BudgetPartial
 	Features      *Features
@@ -76,14 +74,11 @@ type fileConfig struct {
 	Provider      string        `toml:"provider"`
 	Model         string        `toml:"model"`
 	BaseURL       string        `toml:"base_url"`
-	OllamaURL     string        `toml:"ollama_url"`
 	APIKey        string        `toml:"api_key"`
 	MaxIterations int           `toml:"max_iterations"`
 	LazyTools     *bool         `toml:"lazy_tools"`
 	SkillRoots    []string      `toml:"skills"`
 	DataDir       string        `toml:"data_dir"`
-	StatePath     string        `toml:"state_path"`
-	StateDBPath   string        `toml:"state_db"`
 	Resume        string        `toml:"resume"`
 	Budget        BudgetPartial `toml:"budget"`
 	Features      Features      `toml:"features"`
@@ -127,9 +122,6 @@ func Resolve(cwd string, env map[string]string, flags Partial) (Settings, error)
 	if settings.DataDir == "" {
 		settings.DataDir = filepath.Join(cwd, ".apex")
 	}
-	if settings.StateDBPath == "" {
-		settings.StateDBPath = filepath.Join(settings.DataDir, "state.json")
-	}
 	return settings, nil
 }
 
@@ -143,7 +135,6 @@ func defaultSettings(cwd, projectConfig, userConfig string) Settings {
 		LazyTools:         false,
 		SkillRoots:        []string{filepath.Join(cwd, ".apex", "skills")},
 		DataDir:           filepath.Join(cwd, ".apex"),
-		StateDBPath:       filepath.Join(cwd, ".apex", "state.json"),
 		Budget:            agent.DefaultBudgetFractions(),
 		BudgetSet:         false,
 		Features:          Features{Sessions: true, Telemetry: true, MCP: true},
@@ -169,21 +160,15 @@ func loadPartial(path string) (Partial, error) {
 		return out, fmt.Errorf("decode %s: %w", path, err)
 	}
 	baseDir := filepath.Dir(path)
-	baseURL := cfg.BaseURL
-	if strings.TrimSpace(baseURL) == "" {
-		baseURL = cfg.OllamaURL
-	}
-	statePath := firstNonEmpty(cfg.StatePath, cfg.StateDBPath)
 	return Partial{
 		Provider:      stringPtr(cfg.Provider),
 		Model:         stringPtr(cfg.Model),
-		BaseURL:       stringPtr(baseURL),
+		BaseURL:       stringPtr(cfg.BaseURL),
 		APIKey:        stringPtr(cfg.APIKey),
 		MaxIterations: intPtr(cfg.MaxIterations),
 		LazyTools:     cfg.LazyTools,
 		SkillRoots:    resolvePaths(baseDir, cfg.SkillRoots),
 		DataDir:       pathPtr(baseDir, cfg.DataDir),
-		StateDBPath:   pathPtr(baseDir, statePath),
 		Resume:        stringPtr(cfg.Resume),
 		Budget:        budgetPtr(cfg.Budget),
 		Features:      &cfg.Features,
@@ -199,7 +184,6 @@ func partialFromEnv(env map[string]string) Partial {
 		env["APEX_BASE_URL"],
 		env["APEX_OPENAI_BASE_URL"],
 		env["OPENAI_BASE_URL"],
-		env["APEX_OLLAMA_URL"],
 	))
 	out.APIKey = stringPtr(firstNonEmpty(env["APEX_API_KEY"], env["OPENAI_API_KEY"]))
 	out.Resume = stringPtr(env["APEX_RESUME"])
@@ -213,7 +197,6 @@ func partialFromEnv(env map[string]string) Partial {
 		out.SkillRoots = splitPaths(v)
 	}
 	out.DataDir = stringPtr(env["APEX_DATA_DIR"])
-	out.StateDBPath = stringPtr(firstNonEmpty(env["APEX_STATE_PATH"], env["APEX_STATE_DB"]))
 	if bp := budgetFromEnv(env); bp != nil {
 		out.Budget = bp
 	}
@@ -244,9 +227,6 @@ func applyPartial(settings *Settings, partial Partial) {
 	}
 	if partial.DataDir != nil && strings.TrimSpace(*partial.DataDir) != "" {
 		settings.DataDir = filepath.Clean(*partial.DataDir)
-	}
-	if partial.StateDBPath != nil && strings.TrimSpace(*partial.StateDBPath) != "" {
-		settings.StateDBPath = filepath.Clean(*partial.StateDBPath)
 	}
 	if partial.Resume != nil {
 		settings.Resume = strings.TrimSpace(*partial.Resume)

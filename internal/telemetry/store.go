@@ -193,6 +193,21 @@ func (s *Store) Totals(ctx context.Context, sessionID string) (Totals, error) {
 	return total, nil
 }
 
+func (s *Store) Artifacts(_ context.Context, sessionID string) ([]SessionArtifact, error) {
+	artifacts, err := s.readArtifacts(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(artifacts, func(i, j int) bool {
+		return artifacts[i].UpdatedAt.After(artifacts[j].UpdatedAt)
+	})
+	out := make([]SessionArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		out = append(out, artifact)
+	}
+	return out, nil
+}
+
 func (s *Store) ByModel(ctx context.Context, sessionID string) (map[string]Totals, error) {
 	metrics, err := s.queryMetrics(ctx, sessionID)
 	if err != nil {
@@ -396,8 +411,17 @@ func telemetrySessionRoot(path string) (string, error) {
 	if strings.EqualFold(filepath.Base(clean), "sessions") {
 		return clean, nil
 	}
-	if filepath.Ext(clean) != "" {
+	if looksLikeFilePath(clean) {
 		return filepath.Join(filepath.Dir(clean), "sessions"), nil
 	}
 	return filepath.Join(clean, "sessions"), nil
+}
+
+func looksLikeFilePath(path string) bool {
+	ext := filepath.Ext(path)
+	if ext == "" {
+		return false
+	}
+	base := filepath.Base(path)
+	return !strings.EqualFold(base, ext)
 }
