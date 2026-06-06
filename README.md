@@ -88,6 +88,10 @@ git diff | ./apex "review these changes"
 
 Stats and session artifacts:
 
+<p align="center">
+  <img src="assets/feature-stats.png" alt="apex-code" width="640">
+</p>
+
 ```bash
 ./apex --stats
 ./apex stats
