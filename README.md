@@ -79,6 +79,18 @@ Useful first commands inside the TUI:
 - `/approve` to run an approved coder plan
 - `/resume` to reopen a previous session
 
+<p align="center">
+  <img src="assets/feature-mode-chat.png" alt="chat" width="640">
+</p>
+
+<p align="center">
+  <img src="assets/feature-mode-coder.png" alt="coder" width="640">
+</p>
+
+<p align="center">
+  <img src="assets/feature-mode-coder-replan.png" alt="coder-replan" width="640">
+</p>
+
 One-shot usage:
 
 ```bash
