@@ -31,6 +31,10 @@ type SessionEvent struct {
 	WorkflowID        string              `json:"workflow_id,omitempty"`
 	TaskID            string              `json:"task_id,omitempty"`
 	Agent             string              `json:"agent,omitempty"`
+	CustomAgent       string              `json:"custom_agent,omitempty"`
+	CustomAgentFile   string              `json:"custom_agent_file,omitempty"`
+	CustomSkills      []string            `json:"custom_skills,omitempty"`
+	CustomSkillFiles  []string            `json:"custom_skill_files,omitempty"`
 	ToolCalls         []string            `json:"tool_calls,omitempty"`
 	ToolCallDetails   []domain.ToolCall   `json:"tool_call_details,omitempty"`
 	ToolResults       int                 `json:"tool_results,omitempty"`
@@ -221,6 +225,8 @@ func sanitizeSessionPart(v string) string {
 
 func cloneSessionEvent(in SessionEvent) SessionEvent {
 	out := in
+	out.CustomSkills = append([]string(nil), in.CustomSkills...)
+	out.CustomSkillFiles = append([]string(nil), in.CustomSkillFiles...)
 	out.ToolCalls = append([]string(nil), in.ToolCalls...)
 	if len(in.ToolCallDetails) > 0 {
 		out.ToolCallDetails = make([]domain.ToolCall, 0, len(in.ToolCallDetails))

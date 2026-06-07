@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/apex-code/apex/internal/agent"
+	"github.com/apex-code/apex/internal/agents"
 	"github.com/apex-code/apex/internal/codermode"
 	"github.com/apex-code/apex/internal/config"
 	"github.com/apex-code/apex/internal/contextmgr"
@@ -48,26 +50,40 @@ type Config struct {
 // Deps bundles the long-lived collaborators an agent run needs. Building them
 // once lets the one-shot, pipe, and interactive modes share identical wiring.
 type Deps struct {
-	Provider           provider.Provider
-	Registry           *tools.Registry
-	Dispatcher         *tools.Dispatcher
-	Context            *contextmgr.Manager
-	Router             *tools.Router
-	Lazy               *tools.LazySet
-	Skills             *skills.Loader
-	Sessions           *session.Store
-	Telemetry          *telemetry.Store
-	TelemetryFiles     *telemetry.FileStore
-	Collector          *telemetry.Collector
-	Workflows          *codermode.Store
-	Coder              *codermode.Engine
-	SessionID          string
-	SessionTurnSeq     int
-	SessionTotalTokens int
-	Initial            []domain.Message
-	cfg                Config
-	sessionMu          sync.RWMutex
+	Provider             provider.Provider
+	Registry             *tools.Registry
+	Dispatcher           *tools.Dispatcher
+	Context              *contextmgr.Manager
+	Router               *tools.Router
+	Lazy                 *tools.LazySet
+	Agents               *agents.Loader
+	Skills               *skills.Loader
+	Sessions             *session.Store
+	Telemetry            *telemetry.Store
+	TelemetryFiles       *telemetry.FileStore
+	Collector            *telemetry.Collector
+	Workflows            *codermode.Store
+	Coder                *codermode.Engine
+	SessionID            string
+	SessionTurnSeq       int
+	SessionTotalTokens   int
+	Initial              []domain.Message
+	cfg                  Config
+	sessionMu            sync.RWMutex
+	extensionMu          sync.RWMutex
 	sessionPendingTokens int
+	activeAgentName      string
+	activeAgent          *agents.Agent
+	activatedSkills      map[string]skills.Skill
+}
+
+type ExtensionSnapshot struct {
+	AvailableAgents  []agents.Header
+	AvailableSkills  []skills.Header
+	ActiveAgent      string
+	ActiveAgentFile  string
+	ActiveSkills     []string
+	ActiveSkillFiles []string
 }
 
 // BuildDeps assembles the provider, tool registry, context manager, and the
@@ -80,6 +96,8 @@ func BuildDeps(cfg Config) (*Deps, error) {
 	registry := tools.NewDefaultRegistry()
 	router := tools.NewRouter(registry)
 
+	agentLoader := agents.NewLoader(filepath.Join(cfg.CWD, ".apex", "agents"))
+	_ = agentLoader.Discover()
 	loader := skills.NewLoader(cfg.SkillRoots...)
 	_ = loader.Discover()
 
@@ -89,15 +107,17 @@ func BuildDeps(cfg Config) (*Deps, error) {
 	})
 
 	deps := &Deps{
-		Provider:   client,
-		Registry:   registry,
-		Dispatcher: tools.NewDispatcher(registry),
-		Context:    ctxMgr,
-		Router:     router,
-		Lazy:       tools.NewLazySet(router),
-		Skills:     loader,
-		Collector:  collector,
-		cfg:        cfg,
+		Provider:        client,
+		Registry:        registry,
+		Dispatcher:      tools.NewDispatcher(registry),
+		Context:         ctxMgr,
+		Router:          router,
+		Lazy:            tools.NewLazySet(router),
+		Agents:          agentLoader,
+		Skills:          loader,
+		Collector:       collector,
+		cfg:             cfg,
+		activatedSkills: map[string]skills.Skill{},
 	}
 
 	sessionRoot := sessionArtifactRoot(cfg.DataDir)
@@ -195,6 +215,10 @@ func (d *Deps) systemMessage() (domain.Message, bool) {
 	if d.cfg.LazyTools {
 		b.WriteString("\nAvailable tools (ask for one by name to use it):\n")
 		b.WriteString(d.Registry.DescribeDeferred())
+		if agentsDoc := d.Agents.Describe(); agentsDoc != "" {
+			b.WriteString("\n\nAvailable agents:\n")
+			b.WriteString(agentsDoc)
+		}
 		if skillsDoc := d.Skills.Describe(); skillsDoc != "" {
 			b.WriteString("\n\nAvailable skills:\n")
 			b.WriteString(skillsDoc)
@@ -227,13 +251,14 @@ func (d *Deps) Options() agent.Options {
 					d.Lazy.Inject(call.Name)
 				}
 			}
-			for _, name := range d.Skills.Match(lastUserText(messages)) {
-				_, _ = d.Skills.Activate(name, d.Lazy)
-			}
+			d.ensureMatchedSkills(lastUserText(messages), d.Lazy)
 			return d.Lazy.Specs()
 		}
 	} else {
 		opts.Tools = d.Registry.Specs()
+	}
+	opts.ExtraSystem = func(messages []domain.Message) []domain.Message {
+		return d.extraSystemMessages(messages)
 	}
 	return opts
 }
@@ -305,6 +330,130 @@ func (d *Deps) SystemMessage() (domain.Message, bool) {
 	return d.systemMessage()
 }
 
+func (d *Deps) Extensions() ExtensionSnapshot {
+	d.extensionMu.RLock()
+	defer d.extensionMu.RUnlock()
+	snapshot := ExtensionSnapshot{
+		AvailableAgents: append([]agents.Header(nil), d.Agents.Headers()...),
+		AvailableSkills: append([]skills.Header(nil), d.Skills.Headers()...),
+		ActiveAgent:     d.activeAgentName,
+		ActiveSkills:    sortedSkillNames(d.activatedSkills),
+	}
+	if d.activeAgent != nil {
+		snapshot.ActiveAgentFile = d.activeAgent.File()
+	}
+	for _, name := range snapshot.ActiveSkills {
+		skill := d.activatedSkills[name]
+		snapshot.ActiveSkillFiles = append(snapshot.ActiveSkillFiles, skill.File())
+	}
+	return snapshot
+}
+
+func (d *Deps) ReloadExtensions() (ExtensionSnapshot, error) {
+	d.extensionMu.Lock()
+	if err := d.Agents.Discover(); err != nil {
+		d.extensionMu.Unlock()
+		return ExtensionSnapshot{}, err
+	}
+	if err := d.Skills.Discover(); err != nil {
+		d.extensionMu.Unlock()
+		return ExtensionSnapshot{}, err
+	}
+	if strings.TrimSpace(d.activeAgentName) != "" {
+		agent, err := d.Agents.Load(d.activeAgentName)
+		if err != nil {
+			d.activeAgentName = ""
+			d.activeAgent = nil
+		} else {
+			d.activeAgent = &agent
+			d.activeAgentName = agent.Name
+		}
+	}
+	nextSkills := map[string]skills.Skill{}
+	for name := range d.activatedSkills {
+		if skill, err := d.Skills.Load(name); err == nil {
+			nextSkills[skill.Name] = skill
+		}
+	}
+	d.activatedSkills = nextSkills
+	snapshot := ExtensionSnapshot{
+		AvailableAgents: append([]agents.Header(nil), d.Agents.Headers()...),
+		AvailableSkills: append([]skills.Header(nil), d.Skills.Headers()...),
+		ActiveAgent:     d.activeAgentName,
+		ActiveSkills:    sortedSkillNames(d.activatedSkills),
+	}
+	if d.activeAgent != nil {
+		snapshot.ActiveAgentFile = d.activeAgent.File()
+	}
+	for _, name := range snapshot.ActiveSkills {
+		skill := d.activatedSkills[name]
+		snapshot.ActiveSkillFiles = append(snapshot.ActiveSkillFiles, skill.File())
+	}
+	d.extensionMu.Unlock()
+	return snapshot, nil
+}
+
+func (d *Deps) SetActiveAgent(name string) error {
+	d.extensionMu.Lock()
+	defer d.extensionMu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		d.activeAgentName = ""
+		d.activeAgent = nil
+		return nil
+	}
+	agent, err := d.Agents.Load(name)
+	if err != nil {
+		return err
+	}
+	d.activeAgentName = agent.Name
+	d.activeAgent = &agent
+	return nil
+}
+
+func (d *Deps) extraSystemMessages(messages []domain.Message) []domain.Message {
+	d.ensureMatchedSkills(lastUserText(messages), nil)
+	d.extensionMu.RLock()
+	defer d.extensionMu.RUnlock()
+	var out []domain.Message
+	if d.activeAgent != nil && strings.TrimSpace(d.activeAgent.Prompt) != "" {
+		out = append(out, domain.Message{
+			Role:    domain.RoleSystem,
+			Content: "Active custom agent `" + d.activeAgent.Name + "` from " + d.activeAgent.File() + ":\n\n" + d.activeAgent.Prompt,
+		})
+	}
+	for _, name := range sortedSkillNames(d.activatedSkills) {
+		skill := d.activatedSkills[name]
+		if strings.TrimSpace(skill.Prompt) == "" {
+			continue
+		}
+		out = append(out, domain.Message{
+			Role:    domain.RoleSystem,
+			Content: "Active custom skill `" + skill.Name + "` from " + skill.File() + ":\n\n" + skill.Prompt,
+		})
+	}
+	return out
+}
+
+func (d *Deps) markSkillActivated(skill skills.Skill) {
+	d.extensionMu.Lock()
+	defer d.extensionMu.Unlock()
+	if d.activatedSkills == nil {
+		d.activatedSkills = map[string]skills.Skill{}
+	}
+	d.activatedSkills[skill.Name] = skill
+}
+
+func (d *Deps) ensureMatchedSkills(text string, set *tools.LazySet) {
+	for _, name := range d.Skills.Match(text) {
+		skill, err := d.Skills.Activate(name, set)
+		if err != nil {
+			continue
+		}
+		d.markSkillActivated(skill)
+	}
+}
+
 func lastUserText(messages []domain.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == domain.RoleUser {
@@ -332,6 +481,7 @@ func (d *Deps) LoadResume(ctx context.Context, selector string) error {
 func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, state agent.LoopState) error {
 	sessionID := d.ensureSessionID()
 	savedBy := d.Collector.LastSavedBy()
+	extensions := d.Extensions()
 	if d.cfg.LazyTools {
 		lazy := tools.MeasureSchemaTokens(nil, d.Registry, d.Lazy.Active()).Saved()
 		if lazy > 0 {
@@ -386,6 +536,10 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 			OutputMessage:    outputMessage,
 			SavedBy:          savedBy,
 			Error:            errorString(turn.Err),
+			CustomAgent:      extensions.ActiveAgent,
+			CustomAgentFile:  extensions.ActiveAgentFile,
+			CustomSkills:     append([]string(nil), extensions.ActiveSkills...),
+			CustomSkillFiles: append([]string(nil), extensions.ActiveSkillFiles...),
 		}); err != nil {
 			return err
 		}
@@ -407,6 +561,10 @@ func (d *Deps) persistRun(ctx context.Context, inputMessages []domain.Message, s
 				ToolCallDetails:   cloneToolCalls([]domain.ToolCall{call}),
 				ToolResults:       len(resultDetails),
 				ToolResultDetails: resultDetails,
+				CustomAgent:       extensions.ActiveAgent,
+				CustomAgentFile:   extensions.ActiveAgentFile,
+				CustomSkills:      append([]string(nil), extensions.ActiveSkills...),
+				CustomSkillFiles:  append([]string(nil), extensions.ActiveSkillFiles...),
 			}); err != nil {
 				return err
 			}
@@ -537,6 +695,15 @@ func cloneSavedBy(in map[string]int) map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+func sortedSkillNames(items map[string]skills.Skill) []string {
+	names := make([]string, 0, len(items))
+	for name := range items {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func toolCallNames(calls []domain.ToolCall) []string {

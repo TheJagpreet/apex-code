@@ -32,8 +32,20 @@ func (stubAgent) CoderExecute(context.Context) (tui.Reply, error)               
 func (stubAgent) CoderExecuteStream(context.Context, func(tui.Reply)) (tui.Reply, error) {
 	return tui.Reply{}, nil
 }
-func (stubAgent) CoderWorkflow() *domain.CoderWorkflow { return nil }
+func (stubAgent) CoderWorkflow() *domain.CoderWorkflow          { return nil }
 func (stubAgent) LiveStatus(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
+func (stubAgent) Extensions() tui.ExtensionView {
+	return tui.ExtensionView{
+		ActiveAgent:      "frontend",
+		ActiveAgentFile:  "frontend.md",
+		ActiveSkills:     []string{"tailwind", "accessibility"},
+		ActiveSkillFiles: []string{"tailwind.md", "accessibility.md"},
+	}
+}
+func (stubAgent) ReloadExtensions(context.Context) (tui.ExtensionView, error) {
+	return stubAgent{}.Extensions(), nil
+}
+func (stubAgent) SetActiveAgent(context.Context, string) error { return nil }
 
 func TestNewViewShowsCoreChrome(t *testing.T) {
 	model := tui.New(context.Background(), stubAgent{}, false)
@@ -46,5 +58,8 @@ func TestNewViewShowsCoreChrome(t *testing.T) {
 	}
 	if strings.Contains(out, "session 1234567890abcdef") {
 		t.Fatalf("view should show compact session id without session prefix: %q", out)
+	}
+	if !strings.Contains(out, "agent frontend.md") || !strings.Contains(out, "tailwind.md+1") {
+		t.Fatalf("view missing extension badges: %q", out)
 	}
 }

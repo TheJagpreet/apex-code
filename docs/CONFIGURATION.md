@@ -48,7 +48,7 @@ APEX_BASE_URL=http://localhost:11434
 | `-base-url` | `APEX_BASE_URL` | provider-specific | Provider base URL |
 | `-max-iterations` | `APEX_MAX_ITERATIONS` | `50` | Max agent loop turns |
 | `-lazy-tools` | `APEX_LAZY_TOOLS` | `false` | Advertise tool names and load schemas on demand |
-| `-skills` | `APEX_SKILLS_DIR` | `./skills` | Skill bundles directory |
+| `-skills` | `APEX_SKILLS_DIR` | `./.apex/skills` | Skill bundle roots |
 | `-data-dir` | `APEX_DATA_DIR` | `./.apex` | Base directory for sessions, workflows, telemetry, and indexes |
 | `-resume` | `APEX_RESUME` | — | Resume a prior session |
 | `-verbose` | — | `false` | Expanded technical detail in the TUI |
@@ -109,6 +109,10 @@ By default apex stores state under `.apex/`:
 
 ```text
 .apex/
+  agents/
+    <agent>.md
+  skills/
+    <skill>.md
   sessions/
     <session-id>/
       session.json
@@ -119,6 +123,10 @@ By default apex stores state under `.apex/`:
 
 `apex sessions`, `apex stats`, resume loading, and coder workflow lookup all read
 from this `sessions/` tree directly.
+
+Custom agents are always discovered from the project-local `.apex/agents/`
+folder. Skills default to `.apex/skills/`, but you can override the skill roots
+with `-skills`, `APEX_SKILLS_DIR`, or `skills = [...]` in `apex.toml`.
 
 If you do not pass `-data-dir`, apex uses `.apex/` in the current working
 directory. To use a different artifact root, pass `-data-dir` or set

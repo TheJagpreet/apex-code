@@ -20,18 +20,24 @@ func (a *approveAgentStub) Send(context.Context, string) (tui.Reply, error) { re
 func (a *approveAgentStub) Stream(context.Context, string, func(string)) (tui.Reply, error) {
 	return tui.Reply{}, nil
 }
-func (a *approveAgentStub) Model() string                                                  { return "deepseek-v4-flash" }
-func (a *approveAgentStub) CWD() string                                                    { return "repo" }
-func (a *approveAgentStub) SessionLabel() string                                           { return "session-1" }
-func (a *approveAgentStub) LazyTools() bool                                                { return false }
-func (a *approveAgentStub) ResumeSession(context.Context, string) error                    { return nil }
-func (a *approveAgentStub) NewSession() error                                              { return nil }
-func (a *approveAgentStub) SetModel(context.Context, string) error                         { return nil }
-func (a *approveAgentStub) ListSessions(context.Context, int) ([]tui.SessionOption, error) { return nil, nil }
-func (a *approveAgentStub) Mode() string                                                   { return "coder" }
-func (a *approveAgentStub) SetMode(context.Context, string) error                          { return nil }
-func (a *approveAgentStub) CoderSubmit(context.Context, string) (tui.Reply, error)        { return tui.Reply{}, nil }
-func (a *approveAgentStub) CoderReview(context.Context, string) (tui.Reply, error)        { return tui.Reply{}, nil }
+func (a *approveAgentStub) Model() string                               { return "deepseek-v4-flash" }
+func (a *approveAgentStub) CWD() string                                 { return "repo" }
+func (a *approveAgentStub) SessionLabel() string                        { return "session-1" }
+func (a *approveAgentStub) LazyTools() bool                             { return false }
+func (a *approveAgentStub) ResumeSession(context.Context, string) error { return nil }
+func (a *approveAgentStub) NewSession() error                           { return nil }
+func (a *approveAgentStub) SetModel(context.Context, string) error      { return nil }
+func (a *approveAgentStub) ListSessions(context.Context, int) ([]tui.SessionOption, error) {
+	return nil, nil
+}
+func (a *approveAgentStub) Mode() string                          { return "coder" }
+func (a *approveAgentStub) SetMode(context.Context, string) error { return nil }
+func (a *approveAgentStub) CoderSubmit(context.Context, string) (tui.Reply, error) {
+	return tui.Reply{}, nil
+}
+func (a *approveAgentStub) CoderReview(context.Context, string) (tui.Reply, error) {
+	return tui.Reply{}, nil
+}
 func (a *approveAgentStub) CoderApprove(context.Context) (tui.Reply, error) {
 	select {
 	case <-a.approveCalled:
@@ -49,8 +55,13 @@ func (a *approveAgentStub) CoderExecuteStream(context.Context, func(tui.Reply)) 
 	}
 	return tui.Reply{Text: "executed"}, nil
 }
-func (a *approveAgentStub) CoderWorkflow() *domain.CoderWorkflow     { return nil }
+func (a *approveAgentStub) CoderWorkflow() *domain.CoderWorkflow          { return nil }
 func (a *approveAgentStub) LiveStatus(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
+func (a *approveAgentStub) Extensions() tui.ExtensionView                 { return tui.ExtensionView{} }
+func (a *approveAgentStub) ReloadExtensions(context.Context) (tui.ExtensionView, error) {
+	return tui.ExtensionView{}, nil
+}
+func (a *approveAgentStub) SetActiveAgent(context.Context, string) error { return nil }
 
 func TestApproveCommandApprovesThenStreamsExecution(t *testing.T) {
 	agent := &approveAgentStub{approveCalled: make(chan struct{}), executeCalled: make(chan struct{})}

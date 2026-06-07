@@ -88,6 +88,11 @@ type Options struct {
 	// the system prompt advertises only deferred descriptors, and full schemas
 	// are paid for a turn at a time. When nil, Options.Tools is used as-is.
 	ToolProvider func(messages []domain.Message) []domain.ToolSpec
+
+	// ExtraSystem returns ephemeral system messages that should be included in
+	// the assembled request for this iteration without permanently mutating the
+	// stored conversation state.
+	ExtraSystem func(messages []domain.Message) []domain.Message
 }
 
 type ToolDispatcher interface {
@@ -241,9 +246,10 @@ func (l *Loop) Run(ctx context.Context, messages []domain.Message, opts Options)
 }
 
 func assembleRequest(messages []domain.Message, opts Options) domain.Request {
+	extraSystem := extraSystemMessages(messages, opts)
 	out, err := promptasm.New().Assemble(context.Background(), promptasm.Input{
 		Model:       opts.Model,
-		System:      systemMessages(messages),
+		System:      append(systemMessages(messages), extraSystem...),
 		Tools:       cloneToolSpecs(opts.Tools),
 		History:     historyMessages(messages),
 		LatestUser:  latestUserMessage(messages),
@@ -255,9 +261,11 @@ func assembleRequest(messages []domain.Message, opts Options) domain.Request {
 		PromptCache: opts.PromptCache,
 	})
 	if err != nil {
+		requestMessages := cloneMessages(messages)
+		requestMessages = appendSystemMessages(requestMessages, extraSystem)
 		return domain.Request{
 			Model:       opts.Model,
-			Messages:    cloneMessages(messages),
+			Messages:    requestMessages,
 			Tools:       cloneToolSpecs(opts.Tools),
 			Temperature: opts.Temperature,
 			MaxTokens:   opts.MaxTokens,
@@ -266,6 +274,45 @@ func assembleRequest(messages []domain.Message, opts Options) domain.Request {
 		}
 	}
 	return out.Request
+}
+
+func extraSystemMessages(messages []domain.Message, opts Options) []domain.Message {
+	if opts.ExtraSystem == nil {
+		return nil
+	}
+	var out []domain.Message
+	for _, msg := range opts.ExtraSystem(cloneMessages(messages)) {
+		if msg.Role != domain.RoleSystem {
+			continue
+		}
+		out = append(out, domain.Message{
+			Role:         domain.RoleSystem,
+			Content:      msg.Content,
+			ToolCalls:    cloneToolCalls(msg.ToolCalls),
+			ToolResults:  cloneToolResults(msg.ToolResults),
+			CacheControl: msg.CacheControl,
+		})
+	}
+	return out
+}
+
+func appendSystemMessages(messages []domain.Message, extra []domain.Message) []domain.Message {
+	if len(extra) == 0 {
+		return messages
+	}
+	out := make([]domain.Message, 0, len(messages)+len(extra))
+	inserted := false
+	for _, msg := range messages {
+		if !inserted && msg.Role != domain.RoleSystem {
+			out = append(out, extra...)
+			inserted = true
+		}
+		out = append(out, msg)
+	}
+	if !inserted {
+		out = append(out, extra...)
+	}
+	return out
 }
 
 func systemMessages(messages []domain.Message) []domain.Message {

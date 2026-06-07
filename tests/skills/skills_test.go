@@ -11,21 +11,26 @@ import (
 
 func writeSkill(t *testing.T, root, name, body string) {
 	t.Helper()
-	dir := filepath.Join(root, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, skills.BundleFile), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, name+".md"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestDiscoverIsLazyAndOrdered(t *testing.T) {
 	root := t.TempDir()
-	writeSkill(t, root, "refactor", `{"name":"refactor","description":"safely rename symbols across the repo","prompt":"BIG PROMPT BODY","tools":["grep","edit"]}`)
-	writeSkill(t, root, "review", `{"name":"review","description":"review a diff for bugs","prompt":"ANOTHER BODY"}`)
+	writeSkill(t, root, "refactor", `---
+name: refactor
+description: safely rename symbols across the repo
+tools: [grep, edit]
+---
+BIG PROMPT BODY`)
+	writeSkill(t, root, "review", `---
+name: review
+description: review a diff for bugs
+---
+ANOTHER BODY`)
 	// A malformed bundle must not abort discovery of the good ones.
-	writeSkill(t, root, "broken", `{not json`)
+	writeSkill(t, root, "broken", `not front matter`)
 
 	loader := skills.NewLoader(root)
 	if err := loader.Discover(); err != nil {
@@ -49,7 +54,13 @@ func TestDiscoverIsLazyAndOrdered(t *testing.T) {
 
 func TestLoadAndMatch(t *testing.T) {
 	root := t.TempDir()
-	writeSkill(t, root, "refactor", `{"name":"refactor","description":"safely rename symbols across the repo","prompt":"BODY","tools":["grep","edit"]}`)
+	writeSkill(t, root, "refactor", `---
+name: refactor
+description: safely rename symbols across the repo
+triggers: [rename, symbols]
+tools: [grep, edit]
+---
+BODY`)
 
 	loader := skills.NewLoader(root)
 	if err := loader.Discover(); err != nil {
@@ -74,6 +85,42 @@ func TestLoadAndMatch(t *testing.T) {
 	}
 	if got := set.Active(); !hasStr(got, "grep") || !hasStr(got, "edit") {
 		t.Fatalf("activating skill did not inject its tools: %v", got)
+	}
+}
+
+func TestDiscoverMarkdownSkillsAndLoadBodyLazily(t *testing.T) {
+	root := t.TempDir()
+	body := `---
+name: docs
+description: improve docs and usage guidance
+triggers:
+  - documentation
+  - README
+tools:
+  - read_file
+---
+Use this skill when the task is about docs quality.`
+	if err := os.WriteFile(filepath.Join(root, "docs.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := skills.NewLoader(root)
+	if err := loader.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	hdrs := loader.Headers()
+	if len(hdrs) != 1 || hdrs[0].Name != "docs" {
+		t.Fatalf("unexpected markdown skill headers: %+v", hdrs)
+	}
+	if got := loader.Match("please improve the README wording"); !hasStr(got, "docs") {
+		t.Fatalf("expected trigger match for markdown skill, got %v", got)
+	}
+	skill, err := loader.Load("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skill.File() != "docs.md" || skill.Prompt == "" || len(skill.Tools) != 1 {
+		t.Fatalf("unexpected markdown skill bundle: %+v", skill)
 	}
 }
 

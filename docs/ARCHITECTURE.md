@@ -81,6 +81,7 @@ Responsibilities:
 - choose one-shot / pipe / TUI mode
 - build the provider, tool registry, session store, telemetry store, workflow store,
   and context manager
+- discover project-local custom agents and skills
 - adapt the runtime into the TUI-facing agent interface
 
 ### `internal/provider`
@@ -227,6 +228,12 @@ as native tools.
 Discovers and activates skill bundles that can add context or tool capability without
 eagerly inflating the prompt.
 
+### `internal/agents`
+
+Discovers project-local agent bundles from `.apex/agents/*.md` and loads the
+selected agent's markdown instructions into the runtime as ephemeral system
+context.
+
 ## Request flow
 
 ### 1. Startup
@@ -239,6 +246,7 @@ the dependency graph.
 The runtime seeds:
 
 - base system instructions
+- discovered custom agent and skill metadata
 - lazy tool catalogue if enabled
 - resumed session state if requested
 
@@ -247,6 +255,7 @@ The runtime seeds:
 Before each provider call, the agent loop:
 
 - optionally refreshes lazy tool schemas
+- injects the selected custom agent prompt and any activated custom skill prompts
 - assembles messages through `promptasm`
 - measures prompt size
 - builds a budget from provider caps + runtime options
@@ -386,6 +395,7 @@ Telemetry records:
 - session rollups
 - savings attributed to lazy tools or compaction
 - workflow/task/agent context for coder-mode turns
+- active custom agent and custom skill file metadata for each chat/tool event
 
 For the OpenAI-compatible adapter, token usage is taken from the provider's
 reported `usage` fields on the completion response stream, not from local token

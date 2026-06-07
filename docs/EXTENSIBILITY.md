@@ -1,10 +1,11 @@
 # Extensibility
 
-`apex-code` now supports three extension paths:
+`apex-code` now supports four extension paths:
 
 1. `apex.toml` for project and user configuration
-2. MCP servers for external tool/resource catalogs
-3. Native Go plugins that register custom tools
+2. project-local markdown agents and skills under `.apex/`
+3. MCP servers for external tool/resource catalogs
+4. Native Go plugins that register custom tools
 
 ## `apex.toml`
 
@@ -21,6 +22,48 @@ See [`docs/apex.toml.example`](./apex.toml.example) for a complete sample.
 
 The primary persistence knob is `data_dir`. By default apex stores sessions,
 telemetry, workflows, and indexes under `.apex/`.
+
+## Custom agents and skills
+
+Project-local agent and skill bundles live under the repository's `.apex/`
+folder:
+
+```text
+.apex/
+  agents/
+    frontend.md
+  skills/
+    docs.md
+```
+
+Both formats use YAML front matter followed by markdown instructions.
+
+Agent example:
+
+```md
+---
+name: frontend
+description: Focus on UI polish and interaction details
+aliases: [ui, ux]
+---
+You are the frontend specialist for this repository.
+```
+
+Skill example:
+
+```md
+---
+name: docs
+description: Improve docs and user guidance
+triggers: [README, documentation]
+tools: [read_file, edit]
+---
+Use this skill when the task is documentation-heavy.
+```
+
+Agents are explicitly loaded from the TUI with `/agent <name>`. Skills are
+discovered cheaply from their YAML metadata first, then their full markdown body
+is loaded only when the runtime activates them.
 
 ## MCP
 

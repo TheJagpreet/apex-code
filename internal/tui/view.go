@@ -38,6 +38,9 @@ type Agent interface {
 	CoderExecuteStream(ctx context.Context, onUpdate func(Reply)) (Reply, error)
 	CoderWorkflow() *domain.CoderWorkflow
 	LiveStatus(ctx context.Context) (Reply, error)
+	Extensions() ExtensionView
+	ReloadExtensions(ctx context.Context) (ExtensionView, error)
+	SetActiveAgent(ctx context.Context, name string) error
 }
 
 // Reply is one agent response rendered into the TUI.
@@ -88,6 +91,21 @@ type ToolCallView struct {
 type DiffView struct {
 	File  string
 	Patch string
+}
+
+type BundleHeaderView struct {
+	Name        string
+	Description string
+	File        string
+}
+
+type ExtensionView struct {
+	AvailableAgents  []BundleHeaderView
+	AvailableSkills  []BundleHeaderView
+	ActiveAgent      string
+	ActiveAgentFile  string
+	ActiveSkills     []string
+	ActiveSkillFiles []string
 }
 
 type entryKind string
@@ -150,6 +168,10 @@ type promptSpec struct {
 
 var slashCommands = []commandSpec{
 	{Name: "/help", Usage: "/help", Description: "show the command reference"},
+	{Name: "/agents", Usage: "/agents", Description: "list discovered custom agents"},
+	{Name: "/agent", Usage: "/agent [name|clear]", Description: "set or clear the active custom agent"},
+	{Name: "/skills", Usage: "/skills", Description: "list discovered and loaded custom skills"},
+	{Name: "/reload", Usage: "/reload", Description: "reload custom agents and skills from disk"},
 	{Name: "/explain", Usage: "/explain", Description: "insert the repo walkthrough starter"},
 	{Name: "/review", Usage: "/review", Description: "insert the code review starter"},
 	{Name: "/fix", Usage: "/fix", Description: "insert the debug and fix starter"},
@@ -397,6 +419,12 @@ func renderBadgeRow(status runtimeStatus) string {
 		styleBadgeOff.Render(status.ContextSummary),
 		styleBadgeOff.Render("cwd " + status.CWD),
 	}
+	if strings.TrimSpace(status.ActiveAgent) != "" {
+		badges = append(badges, styleBadgeOn.Render("agent "+compactBundleLabel(status.ActiveAgent)))
+	}
+	if len(status.ActiveSkills) > 0 {
+		badges = append(badges, styleBadgeOff.Render("skills "+compactBundleList(status.ActiveSkills)))
+	}
 	return strings.Join(badges, " ")
 }
 
@@ -409,6 +437,27 @@ func compactSessionLabel(label string) string {
 		return label
 	}
 	return label[:8] + "..."
+}
+
+func compactBundleLabel(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "-"
+	}
+	if len(label) <= 18 {
+		return label
+	}
+	return label[:15] + "..."
+}
+
+func compactBundleList(items []string) string {
+	if len(items) == 0 {
+		return "-"
+	}
+	if len(items) == 1 {
+		return compactBundleLabel(items[0])
+	}
+	return compactBundleLabel(items[0]) + fmt.Sprintf("+%d", len(items)-1)
 }
 
 func renderToolInspector(calls []ToolCallView) string {

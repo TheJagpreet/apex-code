@@ -176,6 +176,10 @@ func TestSessionFileStoreAppendsStructuredTelemetry(t *testing.T) {
 		WorkflowID:       "wf-1",
 		TaskID:           "T1",
 		Agent:            "solutioner",
+		CustomAgent:      "frontend",
+		CustomAgentFile:  "frontend.md",
+		CustomSkills:     []string{"tailwind"},
+		CustomSkillFiles: []string{"tailwind.md"},
 	})
 	if err != nil {
 		t.Fatalf("append event 2: %v", err)
@@ -194,6 +198,8 @@ func TestSessionFileStoreAppendsStructuredTelemetry(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"session_id": "sess-1"`) ||
 		!strings.Contains(string(data), `"workflow_id": "wf-1"`) ||
+		!strings.Contains(string(data), `"custom_agent": "frontend"`) ||
+		!strings.Contains(string(data), `"custom_skill_files"`) ||
 		!strings.Contains(string(data), `"tool_call_details"`) ||
 		!strings.Contains(string(data), `"input_messages"`) ||
 		!strings.Contains(string(data), `"output_message"`) ||

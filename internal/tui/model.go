@@ -58,6 +58,8 @@ type runtimeStatus struct {
 	ContextSummary string
 	LazyTools      bool
 	Mode           string
+	ActiveAgent    string
+	ActiveSkills   []string
 }
 
 // replyMsg carries an agent reply back into the Bubble Tea update loop.
@@ -637,6 +639,92 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		})
 		m.selectLatestEntry()
 		m.scrollToBottom()
+	case "/agents":
+		ext := m.agent.Extensions()
+		lines := []string{"Discovered custom agents:"}
+		if len(ext.AvailableAgents) == 0 {
+			lines = append(lines, "(none found under .apex/agents)")
+		} else {
+			for _, agent := range ext.AvailableAgents {
+				line := fmt.Sprintf("- %s (%s)", agent.Name, agent.File)
+				if strings.TrimSpace(agent.Description) != "" {
+					line += "  " + agent.Description
+				}
+				if ext.ActiveAgent == agent.Name {
+					line += "  [active]"
+				}
+				lines = append(lines, line)
+			}
+		}
+		m.transcript = append(m.transcript, transcriptEntry{Kind: entryStatus, Title: "Custom agents", Body: strings.Join(lines, "\n")})
+		m.selectLatestEntry()
+		m.scrollToBottom()
+	case "/agent":
+		if len(fields) == 1 {
+			ext := m.agent.Extensions()
+			body := "No custom agent is active."
+			if strings.TrimSpace(ext.ActiveAgent) != "" {
+				body = "Active custom agent: " + ext.ActiveAgent
+				if strings.TrimSpace(ext.ActiveAgentFile) != "" {
+					body += " (" + ext.ActiveAgentFile + ")"
+				}
+			}
+			m.transcript = append(m.transcript, transcriptEntry{Kind: entryStatus, Title: "Custom agent", Body: body})
+			m.selectLatestEntry()
+			m.scrollToBottom()
+			break
+		}
+		target := fields[1]
+		if strings.EqualFold(target, "clear") {
+			target = ""
+		}
+		if err := m.agent.SetActiveAgent(m.ctx, target); err != nil {
+			return m, nil, err
+		}
+		body := "Cleared the active custom agent."
+		if strings.TrimSpace(target) != "" {
+			ext := m.agent.Extensions()
+			body = "Loaded custom agent: " + ext.ActiveAgent
+			if strings.TrimSpace(ext.ActiveAgentFile) != "" {
+				body += " (" + ext.ActiveAgentFile + ")"
+			}
+		}
+		m.transcript = append(m.transcript, transcriptEntry{Kind: entryStatus, Title: "Custom agent", Body: body})
+		m.selectLatestEntry()
+		m.scrollToBottom()
+	case "/skills":
+		ext := m.agent.Extensions()
+		lines := []string{"Discovered custom skills:"}
+		if len(ext.AvailableSkills) == 0 {
+			lines = append(lines, "(none found under .apex/skills)")
+		} else {
+			active := map[string]bool{}
+			for _, name := range ext.ActiveSkills {
+				active[name] = true
+			}
+			for _, skill := range ext.AvailableSkills {
+				line := fmt.Sprintf("- %s (%s)", skill.Name, skill.File)
+				if strings.TrimSpace(skill.Description) != "" {
+					line += "  " + skill.Description
+				}
+				if active[skill.Name] {
+					line += "  [loaded]"
+				}
+				lines = append(lines, line)
+			}
+		}
+		m.transcript = append(m.transcript, transcriptEntry{Kind: entryStatus, Title: "Custom skills", Body: strings.Join(lines, "\n")})
+		m.selectLatestEntry()
+		m.scrollToBottom()
+	case "/reload":
+		ext, err := m.agent.ReloadExtensions(m.ctx)
+		if err != nil {
+			return m, nil, err
+		}
+		body := fmt.Sprintf("Reloaded %d agent file(s) and %d skill file(s).", len(ext.AvailableAgents), len(ext.AvailableSkills))
+		m.transcript = append(m.transcript, transcriptEntry{Kind: entryStatus, Title: "Extensions reloaded", Body: body})
+		m.selectLatestEntry()
+		m.scrollToBottom()
 	case "/pin":
 		for _, f := range fields[1:] {
 			m.pinned[f] = true
@@ -929,6 +1017,9 @@ func (m Model) View() string {
 		LazyTools:      m.agent.LazyTools(),
 		Mode:           m.agent.Mode(),
 	}
+	ext := m.agent.Extensions()
+	status.ActiveAgent = ext.ActiveAgentFile
+	status.ActiveSkills = append([]string(nil), ext.ActiveSkillFiles...)
 	inner := m.frameInnerWidth()
 	header := wrapTo(m.headerView(status), inner)
 	chrome := wrapTo(m.renderChrome(status), inner)
@@ -1235,6 +1326,9 @@ func (m *Model) scrollMetrics() (total, height int) {
 		LazyTools:      m.agent.LazyTools(),
 		Mode:           m.agent.Mode(),
 	}
+	ext := m.agent.Extensions()
+	status.ActiveAgent = ext.ActiveAgentFile
+	status.ActiveSkills = append([]string(nil), ext.ActiveSkillFiles...)
 	inner := m.frameInnerWidth()
 	height = m.conversationHeight(wrapTo(m.headerView(status), inner), wrapTo(m.renderChrome(status), inner))
 	if len(m.transcript) == 0 {

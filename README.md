@@ -33,6 +33,7 @@ treats context as the scarcest resource.
 - Token-efficient runtime: budgeting, compaction, lazy tool loading, and inspectable telemetry.
 - Workflow-aware coder mode: plan, review, approve, and execute longer jobs in steps.
 - Polished TUI: a real terminal workspace with panes, sessions, and live status.
+- Project-local extensibility: drop custom agent and skill markdown bundles into `.apex/`.
 
 ## Install
 
@@ -76,6 +77,9 @@ Useful first commands inside the TUI:
 
 - `/coder` to enter planner-backed coder mode
 - `/chat` to return to normal chat mode
+- `/agents` and `/agent <name>` to inspect or load a custom agent
+- `/skills` to inspect discovered and loaded custom skills
+- `/reload` to rescan `.apex/agents` and `.apex/skills`
 - `/approve` to run an approved coder plan
 - `/resume` to reopen a previous session
 
@@ -125,9 +129,11 @@ Provider selection is automatic:
 
 - Interactive TUI with markdown rendering, panes, scrolling transcript, and live stats
 - Coder mode with planner-backed workflows, review, approve, and execution
+- Custom markdown agents under `.apex/agents/*.md`
+- Custom markdown skills under `.apex/skills/*.md` with lazy body loading
 - Built-in tools for reading, editing, searching, running commands, focused web/raw/JSON fetches, and repo cloning
 - File-based sessions under `.apex/sessions/<session-id>/`
-- Structured per-session telemetry with raw LLM I/O, tool arguments, tool results, and provider-reported token usage
+- Structured per-session telemetry with raw LLM I/O, tool arguments, tool results, provider-reported token usage, and active custom agent/skill metadata
 
 ## Docs
 

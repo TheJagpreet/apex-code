@@ -54,6 +54,31 @@ func (a *tuiAgent) SessionLabel() string {
 
 func (a *tuiAgent) LazyTools() bool { return a.deps.cfg.LazyTools }
 
+func (a *tuiAgent) Extensions() tui.ExtensionView {
+	if a.deps == nil {
+		return tui.ExtensionView{}
+	}
+	return toExtensionView(a.deps.Extensions())
+}
+
+func (a *tuiAgent) ReloadExtensions(_ context.Context) (tui.ExtensionView, error) {
+	if a.deps == nil {
+		return tui.ExtensionView{}, nil
+	}
+	snapshot, err := a.deps.ReloadExtensions()
+	if err != nil {
+		return tui.ExtensionView{}, err
+	}
+	return toExtensionView(snapshot), nil
+}
+
+func (a *tuiAgent) SetActiveAgent(_ context.Context, name string) error {
+	if a.deps == nil {
+		return nil
+	}
+	return a.deps.SetActiveAgent(name)
+}
+
 func (a *tuiAgent) Mode() string {
 	if strings.TrimSpace(a.mode) == "" {
 		return "chat"
@@ -745,4 +770,28 @@ func compactLine(s string) string {
 		s = s[:120] + " …"
 	}
 	return s
+}
+
+func toExtensionView(snapshot ExtensionSnapshot) tui.ExtensionView {
+	view := tui.ExtensionView{
+		ActiveAgent:      snapshot.ActiveAgent,
+		ActiveAgentFile:  snapshot.ActiveAgentFile,
+		ActiveSkills:     append([]string(nil), snapshot.ActiveSkills...),
+		ActiveSkillFiles: append([]string(nil), snapshot.ActiveSkillFiles...),
+	}
+	for _, agent := range snapshot.AvailableAgents {
+		view.AvailableAgents = append(view.AvailableAgents, tui.BundleHeaderView{
+			Name:        agent.Name,
+			Description: agent.Description,
+			File:        agent.File(),
+		})
+	}
+	for _, skill := range snapshot.AvailableSkills {
+		view.AvailableSkills = append(view.AvailableSkills, tui.BundleHeaderView{
+			Name:        skill.Name,
+			Description: skill.Description,
+			File:        skill.File(),
+		})
+	}
+	return view
 }

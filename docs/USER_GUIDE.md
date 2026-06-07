@@ -9,6 +9,7 @@ The TUI is a full Bubble Tea workspace rather than a scrolling log:
 
 - Branded landing banner that collapses into a compact header once a session is active
 - Compact top bar with session id, mode, companion, token count, and cwd
+- Header badges for the currently loaded custom agent and lazily loaded custom skills
 - Height-bounded scrollable transcript with mouse wheel, `PgUp`/`PgDn`, `Home`/`End`,
   and arrow-key navigation when the composer is empty
 - Markdown rendering for assistant replies
@@ -49,6 +50,10 @@ Workflow JSON files are stored under the active session folder in `workflows/`.
 | Command | What it does |
 |---|---|
 | `/help` | Show the command reference |
+| `/agents` | List discovered custom agents from `.apex/agents/` |
+| `/agent [name\|clear]` | Load or clear the active custom agent |
+| `/skills` | List discovered skills from `.apex/skills/` and show which ones are loaded |
+| `/reload` | Reload custom agents and skills from disk |
 | `/explain` `/review` `/fix` `/test` | Insert a prompt starter |
 | `/model [name]` | Show or switch the active model |
 | `/chat` · `/coder` | Switch directly between chat mode and coder mode |
@@ -89,6 +94,41 @@ Built-in tools currently include:
 
 Tool activity appears in the tools pane, and edits surface in the diffs pane before
 they land.
+
+## Custom agents and skills
+
+`apex-code` discovers project-local markdown bundles from:
+
+- `.apex/agents/*.md`
+- `.apex/skills/*.md`
+
+Both use YAML front matter plus a markdown body. Agents are user-selected with
+`/agent <name>`. Skills are advertised by metadata first and their full markdown
+body is only loaded into the prompt when the runtime activates them.
+
+Example custom agent:
+
+```md
+---
+name: frontend
+description: Focus on UI polish, layout, and interaction details
+aliases: [ui, ux]
+---
+You are the frontend specialist for this repository.
+Prefer thoughtful interaction design and accessible UI changes.
+```
+
+Example custom skill:
+
+```md
+---
+name: docs
+description: Improve docs and end-user guidance
+triggers: [README, documentation, guide]
+tools: [read_file, edit]
+---
+Use this skill when the task is about documentation quality, onboarding, or usage examples.
+```
 
 ## Sessions in the TUI
 

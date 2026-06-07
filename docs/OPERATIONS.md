@@ -33,6 +33,7 @@ It records:
 - exact provider `output_message`
 - raw tool-call arguments
 - tool results
+- active custom agent and custom skill file metadata for each chat/tool event
 - workflow, task, and agent context for coder mode
 
 For OpenAI-compatible providers, telemetry token usage comes from the API's own

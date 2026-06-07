@@ -24,25 +24,36 @@ func (budgetAgentStub) Stream(context.Context, string, func(string)) (tui.Reply,
 		},
 	}, nil
 }
-func (budgetAgentStub) Model() string                                                  { return "deepseek-v4-flash" }
-func (budgetAgentStub) CWD() string                                                    { return "repo" }
-func (budgetAgentStub) SessionLabel() string                                           { return "session-1" }
-func (budgetAgentStub) LazyTools() bool                                                { return false }
-func (budgetAgentStub) ResumeSession(context.Context, string) error                    { return nil }
-func (budgetAgentStub) NewSession() error                                              { return nil }
-func (budgetAgentStub) SetModel(context.Context, string) error                         { return nil }
-func (budgetAgentStub) ListSessions(context.Context, int) ([]tui.SessionOption, error) { return nil, nil }
-func (budgetAgentStub) Mode() string                                                   { return "chat" }
-func (budgetAgentStub) SetMode(context.Context, string) error                          { return nil }
-func (budgetAgentStub) CoderSubmit(context.Context, string) (tui.Reply, error)        { return tui.Reply{}, nil }
-func (budgetAgentStub) CoderReview(context.Context, string) (tui.Reply, error)        { return tui.Reply{}, nil }
-func (budgetAgentStub) CoderApprove(context.Context) (tui.Reply, error)               { return tui.Reply{}, nil }
-func (budgetAgentStub) CoderExecute(context.Context) (tui.Reply, error)               { return tui.Reply{}, nil }
+func (budgetAgentStub) Model() string                               { return "deepseek-v4-flash" }
+func (budgetAgentStub) CWD() string                                 { return "repo" }
+func (budgetAgentStub) SessionLabel() string                        { return "session-1" }
+func (budgetAgentStub) LazyTools() bool                             { return false }
+func (budgetAgentStub) ResumeSession(context.Context, string) error { return nil }
+func (budgetAgentStub) NewSession() error                           { return nil }
+func (budgetAgentStub) SetModel(context.Context, string) error      { return nil }
+func (budgetAgentStub) ListSessions(context.Context, int) ([]tui.SessionOption, error) {
+	return nil, nil
+}
+func (budgetAgentStub) Mode() string                          { return "chat" }
+func (budgetAgentStub) SetMode(context.Context, string) error { return nil }
+func (budgetAgentStub) CoderSubmit(context.Context, string) (tui.Reply, error) {
+	return tui.Reply{}, nil
+}
+func (budgetAgentStub) CoderReview(context.Context, string) (tui.Reply, error) {
+	return tui.Reply{}, nil
+}
+func (budgetAgentStub) CoderApprove(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
+func (budgetAgentStub) CoderExecute(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
 func (budgetAgentStub) CoderExecuteStream(context.Context, func(tui.Reply)) (tui.Reply, error) {
 	return tui.Reply{}, nil
 }
-func (budgetAgentStub) CoderWorkflow() *domain.CoderWorkflow     { return nil }
+func (budgetAgentStub) CoderWorkflow() *domain.CoderWorkflow          { return nil }
 func (budgetAgentStub) LiveStatus(context.Context) (tui.Reply, error) { return tui.Reply{}, nil }
+func (budgetAgentStub) Extensions() tui.ExtensionView                 { return tui.ExtensionView{} }
+func (budgetAgentStub) ReloadExtensions(context.Context) (tui.ExtensionView, error) {
+	return tui.ExtensionView{}, nil
+}
+func (budgetAgentStub) SetActiveAgent(context.Context, string) error { return nil }
 
 func TestViewShowsTrackedSessionTokensInHeader(t *testing.T) {
 	model := tui.New(context.Background(), budgetAgentStub{}, false)
