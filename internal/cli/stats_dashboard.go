@@ -18,21 +18,25 @@ import (
 )
 
 type dashboardView struct {
-	GeneratedAt   string
-	ScopeLabel    string
-	DataDir       string
-	Overview      dashboardOverview
-	Sessions      []dashboardSession
-	Models        []dashboardModel
-	Tools         []dashboardTool
-	Agents        []dashboardAgent
-	RecentLLM     []telemetry.TurnMetric
-	OverviewJSON  template.JS
-	SessionsJSON  template.JS
-	ModelsJSON    template.JS
-	ToolsJSON     template.JS
-	AgentsJSON    template.JS
-	RecentLLMJSON template.JS
+	GeneratedAt      string
+	ScopeLabel       string
+	DataDir          string
+	Overview         dashboardOverview
+	Sessions         []dashboardSession
+	Models           []dashboardModel
+	Tools            []dashboardTool
+	Agents           []dashboardAgent
+	CustomAgents     []dashboardExtension
+	CustomSkills     []dashboardExtension
+	RecentLLM        []telemetry.TurnMetric
+	OverviewJSON     template.JS
+	SessionsJSON     template.JS
+	ModelsJSON       template.JS
+	ToolsJSON        template.JS
+	AgentsJSON       template.JS
+	CustomAgentsJSON template.JS
+	CustomSkillsJSON template.JS
+	RecentLLMJSON    template.JS
 }
 
 type dashboardOverview struct {
@@ -40,6 +44,8 @@ type dashboardOverview struct {
 	LLMCalls           int
 	ToolRuns           int
 	WorkflowCount      int
+	CustomAgentCount   int
+	CustomSkillCount   int
 	PromptTokens       int
 	CompletionTokens   int
 	TotalTokens        int
@@ -93,6 +99,15 @@ type dashboardAgent struct {
 	LLMCalls     int
 	ToolRuns     int
 	WorkflowRuns int
+	TotalTokens  int
+}
+
+type dashboardExtension struct {
+	Name         string
+	Files        []string
+	SessionCount int
+	LLMCalls     int
+	ToolRuns     int
 	TotalTokens  int
 }
 
@@ -162,6 +177,8 @@ func newDashboardView(dataDir string, report statsReport, sessionID string, incl
 			LLMCalls:           report.overview.llmCalls,
 			ToolRuns:           report.overview.toolRuns,
 			WorkflowCount:      report.overview.workflowCount,
+			CustomAgentCount:   report.overview.customAgentCount,
+			CustomSkillCount:   report.overview.customSkillCount,
 			PromptTokens:       report.overview.promptTokens,
 			CompletionTokens:   report.overview.completionTokens,
 			TotalTokens:        report.overview.totalTokens,
@@ -223,6 +240,26 @@ func newDashboardView(dataDir string, report statsReport, sessionID string, incl
 			TotalTokens:  agent.totalTokens,
 		})
 	}
+	for _, item := range report.customAgents {
+		view.CustomAgents = append(view.CustomAgents, dashboardExtension{
+			Name:         item.name,
+			Files:        append([]string(nil), item.files...),
+			SessionCount: len(item.sessionIDs),
+			LLMCalls:     item.llmCalls,
+			ToolRuns:     item.toolRuns,
+			TotalTokens:  item.totalTokens,
+		})
+	}
+	for _, item := range report.customSkills {
+		view.CustomSkills = append(view.CustomSkills, dashboardExtension{
+			Name:         item.name,
+			Files:        append([]string(nil), item.files...),
+			SessionCount: len(item.sessionIDs),
+			LLMCalls:     item.llmCalls,
+			ToolRuns:     item.toolRuns,
+			TotalTokens:  item.totalTokens,
+		})
+	}
 	if !includeModels {
 		view.Models = nil
 	}
@@ -243,6 +280,12 @@ func newDashboardView(dataDir string, report statsReport, sessionID string, incl
 		return dashboardView{}, err
 	}
 	if view.AgentsJSON, err = mustJSON(view.Agents); err != nil {
+		return dashboardView{}, err
+	}
+	if view.CustomAgentsJSON, err = mustJSON(view.CustomAgents); err != nil {
+		return dashboardView{}, err
+	}
+	if view.CustomSkillsJSON, err = mustJSON(view.CustomSkills); err != nil {
 		return dashboardView{}, err
 	}
 	if view.RecentLLMJSON, err = mustJSON(view.RecentLLM); err != nil {
@@ -502,7 +545,7 @@ var statsDashboardTemplate = template.Must(template.New("stats-dashboard").Funcs
     <section class="hero">
       <div class="eyebrow">Apex Telemetry</div>
       <h1>Session Intelligence Dashboard</h1>
-      <div class="subtitle">A polished readout of everything apex can infer from your <span class="mono">.apex/sessions</span> artifact tree: sessions, workflows, agents, tokens, tools, latency, and recent model activity.</div>
+      <div class="subtitle">A polished readout of everything apex can infer from your <span class="mono">.apex/sessions</span> artifact tree: sessions, workflows, coder agents, custom agents, custom skills, tokens, tools, latency, and recent model activity.</div>
       <div class="hero-meta">
         <div class="chip">{{ .ScopeLabel }}</div>
         <div class="chip">Data root: {{ .DataDir }}</div>
@@ -517,6 +560,8 @@ var statsDashboardTemplate = template.Must(template.New("stats-dashboard").Funcs
         <div class="card"><div class="label">LLM Calls</div><div class="value">{{ formatInt .Overview.LLMCalls }}</div><div class="hint">Prompt/response turns</div></div>
         <div class="card"><div class="label">Tool Runs</div><div class="value">{{ formatInt .Overview.ToolRuns }}</div><div class="hint">Standalone tool executions</div></div>
         <div class="card"><div class="label">Workflows</div><div class="value">{{ formatInt .Overview.WorkflowCount }}</div><div class="hint">Coder workflows observed</div></div>
+        <div class="card"><div class="label">Custom Agents</div><div class="value">{{ formatInt .Overview.CustomAgentCount }}</div><div class="hint">Unique custom agent bundles used</div></div>
+        <div class="card"><div class="label">Custom Skills</div><div class="value">{{ formatInt .Overview.CustomSkillCount }}</div><div class="hint">Unique custom skill bundles used</div></div>
         <div class="card"><div class="label">Total Tokens</div><div class="value">{{ formatInt .Overview.TotalTokens }}</div><div class="hint">{{ formatInt .Overview.PromptTokens }} prompt / {{ formatInt .Overview.CompletionTokens }} completion</div></div>
         <div class="card"><div class="label">Average Latency</div><div class="value">{{ formatDurationMs .Overview.AvgLatencyMs }}</div><div class="hint">Across all LLM calls</div></div>
         <div class="card"><div class="label">Models</div><div class="value accent">{{ join .Overview.Models }}</div><div class="hint">Observed across sessions</div></div>
@@ -642,6 +687,64 @@ var statsDashboardTemplate = template.Must(template.New("stats-dashboard").Funcs
       </section>
     </div>
 
+    <div class="grid-2">
+      <section class="section">
+        <h2>Custom Agents</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Files</th>
+              <th>Sessions</th>
+              <th>LLM</th>
+              <th>Tools</th>
+              <th>Tokens</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{ range .CustomAgents }}
+            <tr>
+              <td>{{ .Name }}</td>
+              <td class="mono">{{ join .Files }}</td>
+              <td>{{ formatInt .SessionCount }}</td>
+              <td>{{ formatInt .LLMCalls }}</td>
+              <td>{{ formatInt .ToolRuns }}</td>
+              <td>{{ formatInt .TotalTokens }}</td>
+            </tr>
+            {{ end }}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <h2>Custom Skills</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Files</th>
+              <th>Sessions</th>
+              <th>LLM</th>
+              <th>Tools</th>
+              <th>Tokens</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{ range .CustomSkills }}
+            <tr>
+              <td>{{ .Name }}</td>
+              <td class="mono">{{ join .Files }}</td>
+              <td>{{ formatInt .SessionCount }}</td>
+              <td>{{ formatInt .LLMCalls }}</td>
+              <td>{{ formatInt .ToolRuns }}</td>
+              <td>{{ formatInt .TotalTokens }}</td>
+            </tr>
+            {{ end }}
+          </tbody>
+        </table>
+      </section>
+    </div>
+
     <section class="section">
       <h2>Recent LLM Calls</h2>
       <table>
@@ -680,6 +783,8 @@ var statsDashboardTemplate = template.Must(template.New("stats-dashboard").Funcs
       models: {{ .ModelsJSON }},
       tools: {{ .ToolsJSON }},
       agents: {{ .AgentsJSON }},
+      customAgents: {{ .CustomAgentsJSON }},
+      customSkills: {{ .CustomSkillsJSON }},
       recentLLM: {{ .RecentLLMJSON }}
     };
   </script>

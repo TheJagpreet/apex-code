@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo-banner.jpg" alt="apex-code" width="640">
+  <img src="assets/logo-banner.jpg" alt="apex-code logo" width="640">
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="assets/apex-code.mp4">
-    <img src="assets/demo-preview.jpg" alt="Watch the apex-code demo video" width="800">
+    <img src="assets/demo-preview.jpg" alt="apex-code demo video — shows an interactive TUI session with chat and coder modes" width="800">
   </a>
 </p>
 
@@ -84,15 +84,15 @@ Useful first commands inside the TUI:
 - `/resume` to reopen a previous session
 
 <p align="center">
-  <img src="assets/feature-mode-chat.png" alt="chat" width="640">
+  <img src="assets/feature-mode-chat.png" alt="apex-code TUI in chat mode — conversation transcript with assistant replies rendered in markdown" width="640">
 </p>
 
 <p align="center">
-  <img src="assets/feature-mode-coder.png" alt="coder" width="640">
+  <img src="assets/feature-mode-coder.png" alt="apex-code TUI in coder mode — planner-backed workflow with review/approve controls" width="640">
 </p>
 
 <p align="center">
-  <img src="assets/feature-mode-coder-replan.png" alt="coder-replan" width="640">
+  <img src="assets/feature-mode-coder-replan.png" alt="apex-code coder mode replan view — showing a plan diff and options to approve or revise" width="640">
 </p>
 
 One-shot usage:
@@ -105,7 +105,7 @@ git diff | ./apex "review these changes"
 Stats and session artifacts:
 
 <p align="center">
-  <img src="assets/feature-stats.png" alt="apex-code" width="640">
+  <img src="assets/feature-stats.png" alt="apex-code stats dashboard — dark HTML report showing session history and token usage" width="640">
 </p>
 
 ```bash

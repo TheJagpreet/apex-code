@@ -29,6 +29,10 @@ func TestMainStatsReadsTelemetryFromSessionsTree(t *testing.T) {
 		PromptTokens:     12,
 		CompletionTokens: 8,
 		TotalTokens:      20,
+		CustomAgent:      "reviewer",
+		CustomAgentFile:  "reviewer.md",
+		CustomSkills:     []string{"docs", "testing"},
+		CustomSkillFiles: []string{"docs.md", "testing.md"},
 	}); err != nil {
 		t.Fatalf("append event: %v", err)
 	}
@@ -50,7 +54,12 @@ func TestMainStatsReadsTelemetryFromSessionsTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read dashboard: %v", err)
 	}
-	if !strings.Contains(string(data), "Session Intelligence Dashboard") || !strings.Contains(string(data), "sess-1") {
+	if !strings.Contains(string(data), "Session Intelligence Dashboard") ||
+		!strings.Contains(string(data), "sess-1") ||
+		!strings.Contains(string(data), "Custom Agents") ||
+		!strings.Contains(string(data), "Custom Skills") ||
+		!strings.Contains(string(data), "reviewer.md") ||
+		!strings.Contains(string(data), "docs.md") {
 		t.Fatalf("dashboard html missing expected content: %s", string(data))
 	}
 }

@@ -79,6 +79,13 @@ func (a *tuiAgent) SetActiveAgent(_ context.Context, name string) error {
 	return a.deps.SetActiveAgent(name)
 }
 
+func (a *tuiAgent) ActivateSkill(_ context.Context, name string) error {
+	if a.deps == nil {
+		return nil
+	}
+	return a.deps.ActivateSkill(name)
+}
+
 func (a *tuiAgent) Mode() string {
 	if strings.TrimSpace(a.mode) == "" {
 		return "chat"
@@ -413,11 +420,15 @@ func (a *tuiAgent) CoderExecuteStream(ctx context.Context, onUpdate func(tui.Rep
 			budget = budgetSnapshot(event.Budget)
 		}
 		onUpdate(tui.Reply{
-			Text:     renderWorkflowProgressEvent(event),
-			Budget:   a.withSessionTokens(budget),
-			Stats:    wfSummary(event.Workflow),
-			Mode:     a.mode,
-			Workflow: a.CoderWorkflow(),
+			Text:              renderWorkflowProgressEvent(event),
+			Budget:            a.withSessionTokens(budget),
+			Stats:             wfSummary(event.Workflow),
+			Mode:              a.mode,
+			Workflow:          a.CoderWorkflow(),
+			ProgressKind:      event.Kind,
+			ProgressAgent:     string(event.Agent),
+			ProgressTaskTitle: event.TaskTitle,
+			ProgressSummary:   strings.TrimSpace(event.Summary),
 		})
 	})
 	a.workflow = &wf
@@ -529,6 +540,18 @@ func renderWorkflowProgressEvent(event codermode.ProgressEvent) string {
 			return fmt.Sprintf("%s failed: %s", colorAgent(event.Agent), strings.TrimSpace(event.Error))
 		}
 		return fmt.Sprintf("%s failed", colorAgent(event.Agent))
+	case "completed":
+		summary := strings.TrimSpace(event.Summary)
+		if summary == "" {
+			if strings.TrimSpace(event.TaskTitle) != "" {
+				return fmt.Sprintf("%s completed: %s", colorAgent(event.Agent), strings.TrimSpace(event.TaskTitle))
+			}
+			return fmt.Sprintf("%s completed", colorAgent(event.Agent))
+		}
+		if strings.TrimSpace(event.TaskTitle) != "" {
+			return fmt.Sprintf("%s completed %s\n\n%s", colorAgent(event.Agent), strings.TrimSpace(event.TaskTitle), summary)
+		}
+		return fmt.Sprintf("%s completed\n\n%s", colorAgent(event.Agent), summary)
 	default:
 		return ""
 	}
@@ -784,6 +807,8 @@ func toExtensionView(snapshot ExtensionSnapshot) tui.ExtensionView {
 			Name:        agent.Name,
 			Description: agent.Description,
 			File:        agent.File(),
+			Aliases:     append([]string(nil), agent.Aliases...),
+			Skills:      append([]string(nil), agent.Skills...),
 		})
 	}
 	for _, skill := range snapshot.AvailableSkills {

@@ -150,6 +150,15 @@ func BuildDeps(cfg Config) (*Deps, error) {
 	deps.Workflows = wfStore
 	deps.Coder = codermode.NewEngine(client, deps.Dispatcher, wfStore, deps.Options)
 	deps.Coder.SetTelemetrySink(deps.appendSessionEvent)
+	deps.Coder.SetTelemetryExtensions(func() telemetry.SessionEvent {
+		ext := deps.Extensions()
+		return telemetry.SessionEvent{
+			CustomAgent:      ext.ActiveAgent,
+			CustomAgentFile:  ext.ActiveAgentFile,
+			CustomSkills:     append([]string(nil), ext.ActiveSkills...),
+			CustomSkillFiles: append([]string(nil), ext.ActiveSkillFiles...),
+		}
+	})
 	if cfg.Features.MCP {
 		for _, server := range cfg.MCPServers {
 			if !server.Enabled || strings.TrimSpace(server.Command) == "" {
@@ -396,6 +405,7 @@ func (d *Deps) ReloadExtensions() (ExtensionSnapshot, error) {
 func (d *Deps) SetActiveAgent(name string) error {
 	d.extensionMu.Lock()
 	defer d.extensionMu.Unlock()
+	d.activatedSkills = map[string]skills.Skill{}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		d.activeAgentName = ""
@@ -411,16 +421,31 @@ func (d *Deps) SetActiveAgent(name string) error {
 	return nil
 }
 
+func (d *Deps) ActivateSkill(name string) error {
+	d.extensionMu.Lock()
+	defer d.extensionMu.Unlock()
+	skill, err := d.Skills.Activate(name, d.Lazy)
+	if err != nil {
+		return err
+	}
+	if d.activatedSkills == nil {
+		d.activatedSkills = map[string]skills.Skill{}
+	}
+	d.activatedSkills[skill.Name] = skill
+	return nil
+}
+
 func (d *Deps) extraSystemMessages(messages []domain.Message) []domain.Message {
 	d.ensureMatchedSkills(lastUserText(messages), nil)
 	d.extensionMu.RLock()
 	defer d.extensionMu.RUnlock()
 	var out []domain.Message
 	if d.activeAgent != nil && strings.TrimSpace(d.activeAgent.Prompt) != "" {
-		out = append(out, domain.Message{
-			Role:    domain.RoleSystem,
-			Content: "Active custom agent `" + d.activeAgent.Name + "` from " + d.activeAgent.File() + ":\n\n" + d.activeAgent.Prompt,
-		})
+		content := "Active custom agent `" + d.activeAgent.Name + "` from " + d.activeAgent.File() + ":\n\n" + d.activeAgent.Prompt
+		if attached := d.renderAttachedSkillDescriptionsLocked(d.activeAgent.Skills); strings.TrimSpace(attached) != "" {
+			content += "\n\nAttached skills available on demand:\n" + attached
+		}
+		out = append(out, domain.Message{Role: domain.RoleSystem, Content: content})
 	}
 	for _, name := range sortedSkillNames(d.activatedSkills) {
 		skill := d.activatedSkills[name]
@@ -445,13 +470,56 @@ func (d *Deps) markSkillActivated(skill skills.Skill) {
 }
 
 func (d *Deps) ensureMatchedSkills(text string, set *tools.LazySet) {
+	allowed := d.allowedAutomaticSkills()
+	if len(allowed) == 0 {
+		return
+	}
 	for _, name := range d.Skills.Match(text) {
+		if !allowed[name] {
+			continue
+		}
 		skill, err := d.Skills.Activate(name, set)
 		if err != nil {
 			continue
 		}
 		d.markSkillActivated(skill)
 	}
+}
+
+func (d *Deps) allowedAutomaticSkills() map[string]bool {
+	d.extensionMu.RLock()
+	defer d.extensionMu.RUnlock()
+	if d.activeAgent == nil || len(d.activeAgent.Skills) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(d.activeAgent.Skills))
+	for _, name := range d.activeAgent.Skills {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+func (d *Deps) renderAttachedSkillDescriptionsLocked(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	headers := d.Skills.Headers()
+	index := make(map[string]skills.Header, len(headers))
+	for _, header := range headers {
+		index[strings.ToLower(header.Name)] = header
+	}
+	var lines []string
+	for _, name := range names {
+		header, ok := index[strings.ToLower(strings.TrimSpace(name))]
+		if !ok {
+			continue
+		}
+		lines = append(lines, "- "+header.Name+": "+header.Description)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func lastUserText(messages []domain.Message) string {

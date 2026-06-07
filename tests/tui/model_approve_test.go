@@ -62,6 +62,7 @@ func (a *approveAgentStub) ReloadExtensions(context.Context) (tui.ExtensionView,
 	return tui.ExtensionView{}, nil
 }
 func (a *approveAgentStub) SetActiveAgent(context.Context, string) error { return nil }
+func (a *approveAgentStub) ActivateSkill(context.Context, string) error  { return nil }
 
 func TestApproveCommandApprovesThenStreamsExecution(t *testing.T) {
 	agent := &approveAgentStub{approveCalled: make(chan struct{}), executeCalled: make(chan struct{})}

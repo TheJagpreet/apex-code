@@ -41,6 +41,7 @@ type Agent interface {
 	Extensions() ExtensionView
 	ReloadExtensions(ctx context.Context) (ExtensionView, error)
 	SetActiveAgent(ctx context.Context, name string) error
+	ActivateSkill(ctx context.Context, name string) error
 }
 
 // Reply is one agent response rendered into the TUI.
@@ -54,6 +55,10 @@ type Reply struct {
 	Stats       string
 	Mode        string
 	Workflow    *domain.CoderWorkflow
+	ProgressKind      string
+	ProgressAgent     string
+	ProgressTaskTitle string
+	ProgressSummary   string
 }
 
 // SessionOption is a compact session listing shown by the TUI.
@@ -97,6 +102,8 @@ type BundleHeaderView struct {
 	Name        string
 	Description string
 	File        string
+	Aliases     []string
+	Skills      []string
 }
 
 type ExtensionView struct {
@@ -285,6 +292,8 @@ func renderWelcome(status runtimeStatus) string {
 	b.WriteString(styleHeader.Render("A compact coding workspace for daily use"))
 	b.WriteString("\n")
 	b.WriteString(styleDim.Render("Start typing, mention files with @, or reach for /help and /prompts."))
+	b.WriteString("\n")
+	b.WriteString(styleDim.Render(fmt.Sprintf("Discovered %d custom agent file(s) and %d custom skill file(s).", status.AgentCount, status.SkillCount)))
 	b.WriteString("\n\n")
 	b.WriteString(renderBadgeRow(status))
 	return b.String()
@@ -297,7 +306,7 @@ func renderHeaderCompact(status runtimeStatus) string {
 	return title + "\n" + renderBadgeRow(status)
 }
 
-func renderTranscript(entries []transcriptEntry, windowSize int, scrollOffset int, verbose bool) string {
+func renderTranscript(entries []transcriptEntry, windowSize int, scrollOffset int, verbose bool, width int) string {
 	if len(entries) == 0 {
 		return ""
 	}
@@ -320,7 +329,7 @@ func renderTranscript(entries []transcriptEntry, windowSize int, scrollOffset in
 		parts = append(parts, styleDim.Render(fmt.Sprintf("[older messages above: %d]", start)))
 	}
 	for _, entry := range entries[start:end] {
-		parts = append(parts, renderEntry(entry, false, verbose))
+		parts = append(parts, renderEntry(entry, false, verbose, width))
 	}
 	if end < len(entries) {
 		parts = append(parts, styleDim.Render(fmt.Sprintf("[newer messages below: %d]", len(entries)-end)))
@@ -331,10 +340,10 @@ func renderTranscript(entries []transcriptEntry, windowSize int, scrollOffset in
 // renderAllEntries renders every transcript entry into one block. The View
 // layer slices this into a height-bounded, line-scrollable viewport, so this
 // function intentionally renders the full conversation.
-func renderAllEntries(entries []transcriptEntry, selected int, verbose bool) string {
+func renderAllEntries(entries []transcriptEntry, selected int, verbose bool, width int) string {
 	parts := make([]string, 0, len(entries))
 	for i, entry := range entries {
-		parts = append(parts, renderEntry(entry, i == selected, verbose))
+		parts = append(parts, renderEntry(entry, i == selected, verbose, width))
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -374,7 +383,10 @@ func renderScrollbar(total, window, scrollOffset, height int) string {
 	return strings.Join(rows, "\n")
 }
 
-func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
+func renderEntry(entry transcriptEntry, selected bool, verbose bool, width int) string {
+	if width < 8 {
+		width = 8
+	}
 	title := entry.Title
 	if title == "" {
 		title = strings.Title(string(entry.Kind))
@@ -385,9 +397,11 @@ func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
 	}
 	switch entry.Kind {
 	case entryUser:
-		body = renderUserPrompt(body)
+		body = wrapTo(renderUserPrompt(body), width)
 	case entryAssistant:
-		body = renderMarkdown(body)
+		body = renderMarkdown(body, width)
+	default:
+		body = wrapTo(body, width)
 	}
 	titleStyle := styleHeader
 	switch entry.Kind {
@@ -400,9 +414,9 @@ func renderEntry(entry transcriptEntry, selected bool, verbose bool) string {
 	if selected {
 		title += "  " + styleDim.Render("[ctrl+y copy]")
 	}
-	block += titleStyle.Render(title)
+	block += wrapTo(titleStyle.Render(title), width)
 	if verbose && entry.Meta != "" {
-		block += "\n" + styleDim.Render(entry.Meta)
+		block += "\n" + wrapTo(styleDim.Render(entry.Meta), width)
 	}
 	block += "\n" + body
 	if selected {
@@ -418,9 +432,11 @@ func renderBadgeRow(status runtimeStatus) string {
 		styleBadgeOn.Render("companion " + status.Companion),
 		styleBadgeOff.Render(status.ContextSummary),
 		styleBadgeOff.Render("cwd " + status.CWD),
+		styleBadgeOff.Render(fmt.Sprintf("agents %d", status.AgentCount)),
+		styleBadgeOff.Render(fmt.Sprintf("skills %d", status.SkillCount)),
 	}
 	if strings.TrimSpace(status.ActiveAgent) != "" {
-		badges = append(badges, styleBadgeOn.Render("agent "+compactBundleLabel(status.ActiveAgent)))
+		badges = append(badges, styleBadgeOn.Render(compactBundleLabel(status.ActiveAgent)))
 	}
 	if len(status.ActiveSkills) > 0 {
 		badges = append(badges, styleBadgeOff.Render("skills "+compactBundleList(status.ActiveSkills)))
@@ -725,6 +741,13 @@ func renderAppFrame(content string, width int) string {
 		frameWidth = 20
 	}
 	return styleAppFrame.Width(frameWidth).Render(content)
+}
+
+func wrapPlainBlock(s string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	return lipgloss.NewStyle().Width(width).Render(s)
 }
 
 func oneLine(s string) string {

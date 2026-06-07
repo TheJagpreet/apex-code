@@ -76,6 +76,9 @@ Workflow JSON files are stored under the active session folder in `workflows/`.
 Type `@` in the composer for fuzzy file completion from a gitignore-aware index
 of the project. Referenced files are passed to the agent as exact relative paths.
 
+Type `#` in the composer for custom skill completion. Selecting `#docs`,
+`#testing`, or another discovered skill explicitly activates it for that prompt.
+
 ## Tools
 
 Built-in tools currently include:
@@ -103,8 +106,11 @@ they land.
 - `.apex/skills/*.md`
 
 Both use YAML front matter plus a markdown body. Agents are user-selected with
-`/agent <name>`. Skills are advertised by metadata first and their full markdown
-body is only loaded into the prompt when the runtime activates them.
+`/agent <name>` or directly via `/<name>`. Skills can be selected explicitly
+with `#<name>`. Skills are advertised by metadata first and their full markdown
+body is only loaded into the prompt when the runtime activates them. If an
+agent declares `skills: [...]`, apex gives that agent the attached skill
+descriptions first and only loads the full skill later on demand.
 
 Example custom agent:
 
@@ -113,6 +119,7 @@ Example custom agent:
 name: frontend
 description: Focus on UI polish, layout, and interaction details
 aliases: [ui, ux]
+skills: [testing]
 ---
 You are the frontend specialist for this repository.
 Prefer thoughtful interaction design and accessible UI changes.

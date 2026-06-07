@@ -36,34 +36,121 @@ folder:
     docs.md
 ```
 
-Both formats use YAML front matter followed by markdown instructions.
+Both formats use:
 
-Agent example:
+1. YAML front matter between leading `---` markers
+2. a markdown body below the front matter
+
+### Agent file format
+
+Agent files live under `.apex/agents/*.md`.
+
+Required fields:
+
+- `name`: unique agent name used by `/agent <name>` and `/<name>`
+- `description`: one-line summary shown in discovery lists
+
+Optional fields:
+
+- `aliases`: alternate names that can be used as slash commands such as `/ui`
+- `skills`: custom skill names that this agent may use on demand
+
+Body:
+
+- Required in practice.
+- The markdown body becomes the agent instruction block injected into the runtime.
+
+Full agent example with all fields:
 
 ```md
 ---
 name: frontend
-description: Focus on UI polish and interaction details
-aliases: [ui, ux]
+description: Focus on UI polish, layout clarity, interaction details, and accessibility
+aliases:
+  - ui
+  - ux
+skills:
+  - testing
+  - docs
 ---
 You are the frontend specialist for this repository.
+
+Priorities:
+
+- Preserve the existing design language when one already exists.
+- Improve spacing, typography, responsiveness, and accessibility.
+- Prefer the smallest safe UI change that materially improves the result.
 ```
 
-Skill example:
+### Skill file format
+
+Skill files live under `.apex/skills/*.md`.
+
+Required fields:
+
+- `name`: unique skill name used by `#<name>` and for lazy activation
+- `description`: one-line summary used in discovery lists and lightweight matching
+
+Optional fields:
+
+- `triggers`: extra keywords or phrases that help the runtime match this skill
+- `tools`: tool names to inject when the skill activates
+
+Body:
+
+- Required in practice.
+- The markdown body becomes the skill instruction block injected only when the
+  skill is activated.
+
+Full skill example with all fields:
 
 ```md
 ---
 name: docs
-description: Improve docs and user guidance
-triggers: [README, documentation]
-tools: [read_file, edit]
+description: Improve README, guides, onboarding text, examples, and developer-facing documentation
+triggers:
+  - README
+  - docs
+  - documentation
+  - onboarding
+tools:
+  - read_file
+  - edit
+  - write_file
+  - grep
 ---
-Use this skill when the task is documentation-heavy.
+Use this skill when the task is primarily about documentation quality or developer guidance.
+
+Expectations:
+
+- Prefer concise, accurate explanations.
+- Keep examples realistic and runnable.
+- Update nearby docs when behavior changes.
 ```
 
-Agents are explicitly loaded from the TUI with `/agent <name>`. Skills are
-discovered cheaply from their YAML metadata first, then their full markdown body
-is loaded only when the runtime activates them.
+### TUI behavior
+
+Agents:
+
+- `/agents` lists discovered agent files
+- `/agent <name>` loads one explicitly
+- `/<name>` or `/<alias>` also loads it directly
+- `/<name> your prompt here` loads the agent and immediately sends the remaining text as the prompt
+- agent-declared `skills:` are not fully loaded just by loading the agent
+- instead, apex passes those attached skill descriptions to the active agent first
+- the full skill body is only injected later if the skill is explicitly activated or lazily matched while that agent is active
+
+Skills:
+
+- `/skills` lists discovered skill files and shows which are currently loaded
+- `#<name>` is the explicit skill syntax in the composer
+- `#<name> your prompt here` activates the skill and sends the remaining text as the prompt
+- typing `#` in the composer shows dropdown autocomplete, just like `/` and `@`
+- lazy auto-activation is limited to the skills attached to the currently active custom agent
+- changing mode with `/chat` or `/coder` clears the active custom agent and any loaded custom skills
+
+Skills are also still loaded lazily from metadata matching. Explicit `#skill`
+tags force activation even if the prompt text would not otherwise match.
 
 ## MCP
 

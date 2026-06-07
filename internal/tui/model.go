@@ -60,6 +60,8 @@ type runtimeStatus struct {
 	Mode           string
 	ActiveAgent    string
 	ActiveSkills   []string
+	AgentCount     int
+	SkillCount     int
 }
 
 // replyMsg carries an agent reply back into the Bubble Tea update loop.
@@ -212,6 +214,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.budget = msg.reply.Budget
 		m.stats = msg.reply.Stats
 		m.workflow = msg.reply.Workflow
+		if msg.reply.ProgressKind == "completed" {
+			if len(m.transcript) > 0 && m.transcript[len(m.transcript)-1].Kind == entryStatus && m.transcript[len(m.transcript)-1].Title == "Workflow progress" {
+				m.transcript = m.transcript[:len(m.transcript)-1]
+			}
+			title := strings.TrimSpace(msg.reply.ProgressAgent)
+			if title == "" {
+				title = "workflow"
+			}
+			body := strings.TrimSpace(msg.reply.ProgressSummary)
+			if body == "" {
+				body = strings.TrimSpace(msg.reply.Text)
+			}
+			m.transcript = append(m.transcript, transcriptEntry{
+				Kind:  entryAssistant,
+				Title: title,
+				Body:  body,
+				Meta:  strings.TrimSpace(msg.reply.ProgressTaskTitle),
+			})
+			m.selectLatestEntry()
+			m.scrollToBottom()
+			return m, waitStream(m.streamCh)
+		}
 		if text := strings.TrimSpace(msg.reply.Text); text != "" {
 			entry := transcriptEntry{
 				Kind:  entryStatus,
@@ -525,10 +549,14 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 
 	rawPrompt := prompt
 	prompt, refs := normalizePromptRefs(prompt)
+	prompt, skillTags := m.normalizePromptSkills(prompt)
 	if len(refs) > 0 {
 		next := m
 		next.appendRefs(refs)
 		m = next
+	}
+	for _, skill := range skillTags {
+		_ = m.agent.ActivateSkill(m.ctx, skill)
 	}
 	m.transcript = append(m.transcript, transcriptEntry{
 		Kind:  entryUser,
@@ -750,6 +778,9 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		if err := m.agent.SetMode(m.ctx, mode); err != nil {
 			return m, nil, err
 		}
+		if err := m.agent.SetActiveAgent(m.ctx, ""); err != nil {
+			return m, nil, err
+		}
 		m.workflow = m.agent.CoderWorkflow()
 		m.transcript = append(m.transcript, transcriptEntry{
 			Kind:  entryStatus,
@@ -957,9 +988,76 @@ func (m Model) command(cmd string) (Model, tea.Cmd, error) {
 		m.selectLatestEntry()
 		m.scrollToBottom()
 	default:
+		if next, cmd, handled, err := m.handleDynamicSlash(cmd, fields); handled {
+			return next, cmd, err
+		}
 		return m, nil, fmt.Errorf("unknown command: %s", fields[0])
 	}
 	return m, nil, nil
+}
+
+func (m Model) handleDynamicSlash(raw string, fields []string) (Model, tea.Cmd, bool, error) {
+	name := strings.TrimPrefix(strings.TrimSpace(fields[0]), "/")
+	if name == "" {
+		return m, nil, false, nil
+	}
+	ext := m.agent.Extensions()
+	followup := strings.TrimSpace(strings.TrimPrefix(raw, fields[0]))
+	for _, agent := range ext.AvailableAgents {
+		if strings.EqualFold(agent.Name, name) || matchesAlias(agent, name) {
+			if err := m.agent.SetActiveAgent(m.ctx, agent.Name); err != nil {
+				return m, nil, true, err
+			}
+			m.transcript = append(m.transcript, transcriptEntry{
+				Kind:  entryStatus,
+				Title: "Custom agent",
+				Body:  "Loaded custom agent: " + agent.Name + " (" + agent.File + ")",
+			})
+			m.selectLatestEntry()
+			m.scrollToBottom()
+			if followup != "" {
+				m.input = followup
+				m.inputCursor = len([]rune(m.input))
+				return m.submitWithCurrentInput()
+			}
+			return m, nil, true, nil
+		}
+	}
+	for _, skill := range ext.AvailableSkills {
+		if strings.EqualFold(skill.Name, name) {
+			if err := m.agent.ActivateSkill(m.ctx, skill.Name); err != nil {
+				return m, nil, true, err
+			}
+			m.transcript = append(m.transcript, transcriptEntry{
+				Kind:  entryStatus,
+				Title: "Custom skill",
+				Body:  "Loaded custom skill: " + skill.Name + " (" + skill.File + ")",
+			})
+			m.selectLatestEntry()
+			m.scrollToBottom()
+			if followup != "" {
+				m.input = followup
+				m.inputCursor = len([]rune(m.input))
+				return m.submitWithCurrentInput()
+			}
+			return m, nil, true, nil
+		}
+	}
+	return m, nil, false, nil
+}
+
+func (m Model) submitWithCurrentInput() (Model, tea.Cmd, bool, error) {
+	next, cmd := m.submit()
+	return next.(Model), cmd, true, nil
+}
+
+func matchesAlias(agent BundleHeaderView, name string) bool {
+	for _, alias := range agent.Aliases {
+		if strings.EqualFold(alias, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // cycleTheme advances to the next color theme and applies it immediately.
@@ -1020,6 +1118,8 @@ func (m Model) View() string {
 	ext := m.agent.Extensions()
 	status.ActiveAgent = ext.ActiveAgentFile
 	status.ActiveSkills = append([]string(nil), ext.ActiveSkillFiles...)
+	status.AgentCount = len(ext.AvailableAgents)
+	status.SkillCount = len(ext.AvailableSkills)
 	inner := m.frameInnerWidth()
 	header := wrapTo(m.headerView(status), inner)
 	chrome := wrapTo(m.renderChrome(status), inner)
@@ -1187,18 +1287,17 @@ func (m Model) renderConversation(height, inner int) string {
 	}
 	// Leave two columns for the scrollbar (" " + bar) so wrapped lines plus the
 	// bar never exceed the frame's inner width.
-	content := renderAllEntries(m.transcript, m.selectedEntry, m.verbose)
+	content := renderAllEntries(m.transcript, m.selectedEntry, m.verbose, frameInner-2)
 	if m.working && m.streamFx.active() {
 		if content != "" {
 			content += "\n\n"
 		}
 		content += renderStreamEntry(m.streamFx)
 	}
-	wrapped := wrapTo(content, frameInner-2)
-	lines := strings.Split(wrapped, "\n")
+	lines := strings.Split(content, "\n")
 	total := len(lines)
 	if total <= contentHeight {
-		return styleConversationFrame.Width(inner).Render(wrapped)
+		return styleConversationFrame.Width(inner).Render(content)
 	}
 	end := total - m.scrollOffset
 	if end > total {
@@ -1236,7 +1335,9 @@ func (m *Model) updateSuggestions() {
 	token := currentToken(m.input)
 	switch {
 	case strings.HasPrefix(token, "/"):
-		m.suggestions = commandSuggestions(token)
+		m.suggestions = m.commandSuggestions(token)
+	case strings.HasPrefix(token, "#"):
+		m.suggestions = m.skillSuggestions(token)
 	case strings.HasPrefix(token, "@"):
 		m.suggestions = fileSuggestions(token, m.fileIndex)
 	default:
@@ -1264,7 +1365,7 @@ func (m Model) shouldAcceptSuggestionOnEnter() bool {
 	if token == expected || token == s.Label {
 		return false
 	}
-	return strings.HasPrefix(token, "/") || strings.HasPrefix(token, "@")
+	return strings.HasPrefix(token, "/") || strings.HasPrefix(token, "@") || strings.HasPrefix(token, "#")
 }
 
 func (m *Model) acceptSuggestion() {
@@ -1329,12 +1430,14 @@ func (m *Model) scrollMetrics() (total, height int) {
 	ext := m.agent.Extensions()
 	status.ActiveAgent = ext.ActiveAgentFile
 	status.ActiveSkills = append([]string(nil), ext.ActiveSkillFiles...)
+	status.AgentCount = len(ext.AvailableAgents)
+	status.SkillCount = len(ext.AvailableSkills)
 	inner := m.frameInnerWidth()
 	height = m.conversationHeight(wrapTo(m.headerView(status), inner), wrapTo(m.renderChrome(status), inner))
 	if len(m.transcript) == 0 {
 		return 0, height
 	}
-	total = lipgloss.Height(wrapTo(renderAllEntries(m.transcript, m.selectedEntry, m.verbose), inner-2))
+	total = lipgloss.Height(renderAllEntries(m.transcript, m.selectedEntry, m.verbose, inner-2))
 	return total, height
 }
 
@@ -1411,7 +1514,7 @@ func currentToken(input string) string {
 	return input[idx+1:]
 }
 
-func commandSuggestions(token string) []suggestion {
+func (m Model) commandSuggestions(token string) []suggestion {
 	token = strings.ToLower(token)
 	var out []suggestion
 	for _, cmd := range slashCommands {
@@ -1425,6 +1528,62 @@ func commandSuggestions(token string) []suggestion {
 			})
 		}
 	}
+	ext := m.agent.Extensions()
+	for _, agent := range ext.AvailableAgents {
+		name := "/" + agent.Name
+		if strings.HasPrefix(strings.ToLower(name), token) {
+			out = append(out, suggestion{
+				Label:   name,
+				Insert:  name + " ",
+				Detail:  "load custom agent from " + agent.File,
+				Kind:    suggestionCommand,
+				Replace: token,
+			})
+		}
+		for _, alias := range agent.Aliases {
+			aliasCmd := "/" + alias
+			if strings.HasPrefix(strings.ToLower(aliasCmd), token) {
+				out = append(out, suggestion{
+					Label:   aliasCmd,
+					Insert:  aliasCmd + " ",
+					Detail:  "load custom agent alias for " + agent.Name,
+					Kind:    suggestionCommand,
+					Replace: token,
+				})
+			}
+		}
+	}
+	for _, skill := range ext.AvailableSkills {
+		name := "/" + skill.Name
+		if strings.HasPrefix(strings.ToLower(name), token) {
+			out = append(out, suggestion{
+				Label:   name,
+				Insert:  name + " ",
+				Detail:  "load custom skill from " + skill.File,
+				Kind:    suggestionCommand,
+				Replace: token,
+			})
+		}
+	}
+	return limitSuggestions(out)
+}
+
+func (m Model) skillSuggestions(token string) []suggestion {
+	query := strings.TrimPrefix(strings.ToLower(token), "#")
+	var out []suggestion
+	for _, skill := range m.agent.Extensions().AvailableSkills {
+		name := strings.ToLower(skill.Name)
+		if query == "" || strings.HasPrefix(name, query) || strings.Contains(name, query) {
+			out = append(out, suggestion{
+				Label:   "#" + skill.Name,
+				Insert:  "#" + skill.Name + " ",
+				Detail:  "load custom skill from " + skill.File,
+				Kind:    suggestionCommand,
+				Replace: token,
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return len(out[i].Label) < len(out[j].Label) })
 	return limitSuggestions(out)
 }
 
@@ -1534,6 +1693,50 @@ func normalizePromptRefs(prompt string) (string, []string) {
 		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String()), refs
+}
+
+func (m Model) normalizePromptSkills(prompt string) (string, []string) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 {
+		return prompt, nil
+	}
+	available := map[string]string{}
+	for _, skill := range m.agent.Extensions().AvailableSkills {
+		available[strings.ToLower(skill.Name)] = skill.Name
+	}
+	var (
+		matched []string
+		seen    = map[string]bool{}
+		kept    []string
+	)
+	for _, field := range fields {
+		if !strings.HasPrefix(field, "#") || len(field) < 2 {
+			kept = append(kept, field)
+			continue
+		}
+		candidate := strings.Trim(strings.TrimPrefix(field, "#"), ",;:()[]{}\"'")
+		name, ok := available[strings.ToLower(candidate)]
+		if !ok {
+			kept = append(kept, field)
+			continue
+		}
+		if !seen[name] {
+			matched = append(matched, name)
+			seen[name] = true
+		}
+	}
+	if len(matched) == 0 {
+		return prompt, nil
+	}
+	var b strings.Builder
+	b.WriteString(strings.Join(kept, " "))
+	b.WriteString("\n\nExplicitly requested skills:\n")
+	for _, name := range matched {
+		b.WriteString("- ")
+		b.WriteString(name)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String()), matched
 }
 
 func indexProjectEntries(root string) []string {

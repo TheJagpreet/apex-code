@@ -54,6 +54,7 @@ func (budgetAgentStub) ReloadExtensions(context.Context) (tui.ExtensionView, err
 	return tui.ExtensionView{}, nil
 }
 func (budgetAgentStub) SetActiveAgent(context.Context, string) error { return nil }
+func (budgetAgentStub) ActivateSkill(context.Context, string) error  { return nil }
 
 func TestViewShowsTrackedSessionTokensInHeader(t *testing.T) {
 	model := tui.New(context.Background(), budgetAgentStub{}, false)

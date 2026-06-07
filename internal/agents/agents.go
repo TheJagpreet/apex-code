@@ -14,6 +14,7 @@ type Agent struct {
 	Name        string   `yaml:"name"`
 	Description string   `yaml:"description"`
 	Aliases     []string `yaml:"aliases,omitempty"`
+	Skills      []string `yaml:"skills,omitempty"`
 
 	Prompt string
 	path   string
@@ -27,6 +28,7 @@ type Header struct {
 	Name        string
 	Description string
 	Aliases     []string
+	Skills      []string
 	Path        string
 }
 
@@ -146,6 +148,7 @@ func readHeader(path string) (Header, error) {
 		Name:        agent.Name,
 		Description: agent.Description,
 		Aliases:     append([]string(nil), agent.Aliases...),
+		Skills:      append([]string(nil), agent.Skills...),
 		Path:        path,
 	}, nil
 }
@@ -155,6 +158,7 @@ func readBundle(path string) (Agent, error) {
 		Name        string   `yaml:"name"`
 		Description string   `yaml:"description"`
 		Aliases     []string `yaml:"aliases,omitempty"`
+		Skills      []string `yaml:"skills,omitempty"`
 	}
 	body, err := bundles.ParseMarkdownBundle(path, &meta)
 	if err != nil {
@@ -164,6 +168,7 @@ func readBundle(path string) (Agent, error) {
 		Name:        strings.TrimSpace(meta.Name),
 		Description: strings.TrimSpace(meta.Description),
 		Aliases:     cleanStrings(meta.Aliases),
+		Skills:      cleanStrings(meta.Skills),
 		Prompt:      body,
 		path:        path,
 	}, nil

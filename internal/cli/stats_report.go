@@ -13,12 +13,14 @@ import (
 )
 
 type statsReport struct {
-	overview  overviewStats
-	sessions  []sessionStats
-	models    []modelStats
-	tools     []toolStats
-	agents    []agentStats
-	recentLLM []telemetry.TurnMetric
+	overview     overviewStats
+	sessions     []sessionStats
+	models       []modelStats
+	tools        []toolStats
+	agents       []agentStats
+	customAgents []extensionStats
+	customSkills []extensionStats
+	recentLLM    []telemetry.TurnMetric
 }
 
 type overviewStats struct {
@@ -26,6 +28,8 @@ type overviewStats struct {
 	llmCalls           int
 	toolRuns           int
 	workflowCount      int
+	customAgentCount   int
+	customSkillCount   int
 	promptTokens       int
 	completionTokens   int
 	totalTokens        int
@@ -82,6 +86,15 @@ type agentStats struct {
 	totalTokens  int
 }
 
+type extensionStats struct {
+	name        string
+	files       []string
+	sessionIDs  map[string]bool
+	llmCalls    int
+	toolRuns    int
+	totalTokens int
+}
+
 func buildStatsReport(ctx context.Context, tele *telemetry.Store, sess *session.Store, sessionID string, traceLimit int) (statsReport, error) {
 	artifacts, err := tele.Artifacts(ctx, sessionID)
 	if err != nil {
@@ -91,6 +104,8 @@ func buildStatsReport(ctx context.Context, tele *telemetry.Store, sess *session.
 	modelIndex := map[string]*modelStats{}
 	toolIndex := map[string]*toolStats{}
 	agentIndex := map[string]*agentStats{}
+	customAgentIndex := map[string]*extensionStats{}
+	customSkillIndex := map[string]*extensionStats{}
 	recordIndex := map[string]session.Record{}
 	workflowSeen := map[string]bool{}
 	overviewModels := map[string]bool{}
@@ -185,6 +200,14 @@ func buildStatsReport(ctx context.Context, tele *telemetry.Store, sess *session.
 						as.workflowRuns++
 					}
 				}
+				accumulateExtensionUsage(customAgentIndex, event.CustomAgent, event.CustomAgentFile, artifact.SessionID, event.TotalTokens, true)
+				for i, name := range event.CustomSkills {
+					file := ""
+					if i < len(event.CustomSkillFiles) {
+						file = event.CustomSkillFiles[i]
+					}
+					accumulateExtensionUsage(customSkillIndex, name, file, artifact.SessionID, event.TotalTokens, true)
+				}
 			case "tool_exec":
 				stats.toolRuns++
 				report.overview.toolRuns++
@@ -220,6 +243,14 @@ func buildStatsReport(ctx context.Context, tele *telemetry.Store, sess *session.
 					if strings.TrimSpace(event.WorkflowID) != "" {
 						as.workflowRuns++
 					}
+				}
+				accumulateExtensionUsage(customAgentIndex, event.CustomAgent, event.CustomAgentFile, artifact.SessionID, 0, false)
+				for i, name := range event.CustomSkills {
+					file := ""
+					if i < len(event.CustomSkillFiles) {
+						file = event.CustomSkillFiles[i]
+					}
+					accumulateExtensionUsage(customSkillIndex, name, file, artifact.SessionID, 0, false)
 				}
 			}
 		}
@@ -266,6 +297,10 @@ func buildStatsReport(ctx context.Context, tele *telemetry.Store, sess *session.
 	report.models = collectModelStats(modelIndex)
 	report.tools = collectToolStats(toolIndex)
 	report.agents = collectAgentStats(agentIndex)
+	report.customAgents = collectExtensionStats(customAgentIndex)
+	report.customSkills = collectExtensionStats(customSkillIndex)
+	report.overview.customAgentCount = len(report.customAgents)
+	report.overview.customSkillCount = len(report.customSkills)
 
 	sort.SliceStable(report.sessions, func(i, j int) bool {
 		return report.sessions[i].lastUpdated.After(report.sessions[j].lastUpdated)
@@ -285,6 +320,8 @@ func renderStatsReport(report statsReport, includeModels, includeSessions bool) 
 		fmt.Sprintf("llm calls      %d", report.overview.llmCalls),
 		fmt.Sprintf("tool runs      %d", report.overview.toolRuns),
 		fmt.Sprintf("workflows      %d", report.overview.workflowCount),
+		fmt.Sprintf("custom agents  %d", report.overview.customAgentCount),
+		fmt.Sprintf("custom skills  %d", report.overview.customSkillCount),
 		fmt.Sprintf("tokens         %s prompt / %s completion / %s total", formatInt(report.overview.promptTokens), formatInt(report.overview.completionTokens), formatInt(report.overview.totalTokens)),
 		fmt.Sprintf("latency        %s avg", formatDurationMs(report.overview.avgLatencyMs)),
 		fmt.Sprintf("cache hit      %.1f%%", report.overview.cacheHitRatio*100),
@@ -304,6 +341,14 @@ func renderStatsReport(report statsReport, includeModels, includeSessions bool) 
 	if len(report.agents) > 0 {
 		b.WriteString("\n\n")
 		b.WriteString(renderAgentsTable(report.agents))
+	}
+	if len(report.customAgents) > 0 {
+		b.WriteString("\n\n")
+		b.WriteString(renderExtensionsTable("Custom Agents", report.customAgents))
+	}
+	if len(report.customSkills) > 0 {
+		b.WriteString("\n\n")
+		b.WriteString(renderExtensionsTable("Custom Skills", report.customSkills))
 	}
 	if len(report.recentLLM) > 0 {
 		b.WriteString("\n\n")
@@ -427,6 +472,22 @@ func renderAgentsTable(agents []agentStats) string {
 	return renderTableBox("Coder Agents", headers, rows)
 }
 
+func renderExtensionsTable(title string, items []extensionStats) string {
+	headers := []string{"name", "files", "sessions", "llm", "tools", "tokens"}
+	rows := make([][]string, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, []string{
+			item.name,
+			renderList(item.files, "-"),
+			formatInt(len(item.sessionIDs)),
+			formatInt(item.llmCalls),
+			formatInt(item.toolRuns),
+			formatInt(item.totalTokens),
+		})
+	}
+	return renderTableBox(title, headers, rows)
+}
+
 func renderRecentTable(metrics []telemetry.TurnMetric) string {
 	headers := []string{"when", "session", "turn", "model", "total", "latency", "term"}
 	rows := make([][]string, 0, len(metrics))
@@ -537,6 +598,60 @@ func collectAgentStats(index map[string]*agentStats) []agentStats {
 		return out[i].totalTokens > out[j].totalTokens
 	})
 	return out
+}
+
+func collectExtensionStats(index map[string]*extensionStats) []extensionStats {
+	out := make([]extensionStats, 0, len(index))
+	for _, item := range index {
+		copyItem := *item
+		copyItem.files = append([]string(nil), item.files...)
+		copyItem.sessionIDs = make(map[string]bool, len(item.sessionIDs))
+		for k, v := range item.sessionIDs {
+			copyItem.sessionIDs[k] = v
+		}
+		sort.Strings(copyItem.files)
+		out = append(out, copyItem)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].totalTokens == out[j].totalTokens {
+			return out[i].name < out[j].name
+		}
+		return out[i].totalTokens > out[j].totalTokens
+	})
+	return out
+}
+
+func accumulateExtensionUsage(index map[string]*extensionStats, name, file, sessionID string, totalTokens int, llm bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	item := index[name]
+	if item == nil {
+		item = &extensionStats{name: name, sessionIDs: map[string]bool{}}
+		index[name] = item
+	}
+	if strings.TrimSpace(file) != "" && !containsString(item.files, file) {
+		item.files = append(item.files, strings.TrimSpace(file))
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		item.sessionIDs[strings.TrimSpace(sessionID)] = true
+	}
+	if llm {
+		item.llmCalls++
+		item.totalTokens += totalTokens
+	} else {
+		item.toolRuns++
+	}
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func firstToolName(event telemetry.SessionEvent) string {

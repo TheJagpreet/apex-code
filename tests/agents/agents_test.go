@@ -16,6 +16,8 @@ description: focus on UI and interaction polish
 aliases:
   - ui
   - ux
+skills:
+  - testing
 ---
 You are the frontend specialist for this repository.`
 	if err := os.WriteFile(filepath.Join(root, "frontend.md"), []byte(body), 0o644); err != nil {
@@ -34,7 +36,7 @@ You are the frontend specialist for this repository.`
 	if err != nil {
 		t.Fatal(err)
 	}
-	if agent.File() != "frontend.md" || agent.Prompt == "" {
+	if agent.File() != "frontend.md" || agent.Prompt == "" || len(agent.Skills) != 1 || agent.Skills[0] != "testing" {
 		t.Fatalf("unexpected agent: %+v", agent)
 	}
 }

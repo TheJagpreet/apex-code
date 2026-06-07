@@ -31,6 +31,7 @@ type Engine struct {
 	store         *Store
 	options       func() agent.Options
 	telemetrySink func(context.Context, telemetry.SessionEvent) error
+	extensions    func() telemetry.SessionEvent
 }
 
 func NewEngine(p provider.Provider, tools agent.ToolDispatcher, store *Store, options func() agent.Options) *Engine {
@@ -39,6 +40,10 @@ func NewEngine(p provider.Provider, tools agent.ToolDispatcher, store *Store, op
 
 func (e *Engine) SetTelemetrySink(sink func(context.Context, telemetry.SessionEvent) error) {
 	e.telemetrySink = sink
+}
+
+func (e *Engine) SetTelemetryExtensions(snapshot func() telemetry.SessionEvent) {
+	e.extensions = snapshot
 }
 
 func (e *Engine) CreatePlan(ctx context.Context, sessionID, prompt string) (domain.CoderWorkflow, error) {
@@ -1490,6 +1495,21 @@ func emitProgress(onProgress func(ProgressEvent), event ProgressEvent) {
 func (e *Engine) recordTelemetry(ctx context.Context, event telemetry.SessionEvent) {
 	if e.telemetrySink == nil {
 		return
+	}
+	if e.extensions != nil {
+		ext := e.extensions()
+		if strings.TrimSpace(event.CustomAgent) == "" {
+			event.CustomAgent = strings.TrimSpace(ext.CustomAgent)
+		}
+		if strings.TrimSpace(event.CustomAgentFile) == "" {
+			event.CustomAgentFile = strings.TrimSpace(ext.CustomAgentFile)
+		}
+		if len(event.CustomSkills) == 0 && len(ext.CustomSkills) > 0 {
+			event.CustomSkills = append([]string(nil), ext.CustomSkills...)
+		}
+		if len(event.CustomSkillFiles) == 0 && len(ext.CustomSkillFiles) > 0 {
+			event.CustomSkillFiles = append([]string(nil), ext.CustomSkillFiles...)
+		}
 	}
 	_ = e.telemetrySink(ctx, event)
 }
